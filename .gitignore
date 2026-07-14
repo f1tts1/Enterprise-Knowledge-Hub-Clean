@@ -1,0 +1,68 @@
+# Operating system metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Personal IDE and editor state
+.idea/
+.vscode/
+*.iml
+.project
+.classpath
+.settings/
+*.swp
+*~
+
+# Java / Maven build output and repository cache
+/enterprise-rag-backend/target/
+/enterprise-rag-backend/out/
+/.m2/
+
+# Python bytecode, test/tool caches, coverage, and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+/.venv/
+/venv/
+/env/
+/rag-ai-service/.venv/
+/rag-ai-service/venv/
+/rag-ai-service/env/
+
+# Local credentials and machine-specific configuration; keep safe templates
+.env
+.env.*
+!.env.example
+application-local.yml
+application-local.yaml
+application-local.properties
+!application-local.example.yml
+!application-local.example.yaml
+!application-local.example.properties
+
+# Logs and process/runtime files
+*.log
+*.pid
+/logs/
+/enterprise-rag-backend/logs/
+/rag-ai-service/logs/
+/tmp/
+/enterprise-rag-backend/dump.rdb
+
+# Local middleware persistence and uploaded user content
+/mysql-data/
+/redis-data/
+/minio-data/
+/qdrant_storage/
+/uploads/
+
+# Local AI models and generated evaluation output
+/.models/
+/models/
+/eval/rag/results/

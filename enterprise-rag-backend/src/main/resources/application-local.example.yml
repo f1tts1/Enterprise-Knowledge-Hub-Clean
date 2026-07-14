@@ -1,0 +1,21 @@
+# 复制为 application-local.yml，替换占位值后通过 local profile 启动。
+# application-local.yml 已被根 .gitignore 忽略，不要提交真实凭证。
+spring:
+  datasource:
+    username: replace-with-your-local-mysql-user
+    password: replace-with-your-local-mysql-password
+  data:
+    redis:
+      password: replace-with-your-local-redis-password
+  rabbitmq:
+    username: replace-with-your-local-rabbitmq-user
+    password: replace-with-your-local-rabbitmq-password
+
+app:
+  security:
+    jwt:
+      secret: replace-with-a-random-secret-of-at-least-32-bytes
+  storage:
+    minio:
+      access-key: replace-with-your-local-minio-access-key
+      secret-key: replace-with-your-local-minio-secret-key

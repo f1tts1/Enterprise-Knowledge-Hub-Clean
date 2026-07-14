@@ -1,0 +1,90 @@
+spring:
+  application:
+    name: enterprise-rag-backend
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: ${DB_URL:jdbc:mysql://localhost:3306/enterprise_knowledge_hub?useUnicode=true&characterEncoding=utf8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD}
+      database: ${REDIS_DATABASE:0}
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME}
+    password: ${RABBITMQ_PASSWORD}
+    virtual-host: ${RABBITMQ_VIRTUAL_HOST:/}
+    listener:
+      simple:
+        acknowledge-mode: manual
+  servlet:
+    multipart:
+      max-file-size: ${DOCUMENT_MAX_FILE_SIZE:20MB}
+      max-request-size: ${DOCUMENT_MAX_REQUEST_SIZE:25MB}
+  sql:
+    init:
+      mode: never
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+
+server:
+  port: 8080
+
+app:
+  security:
+    jwt:
+      secret: ${JWT_SECRET}
+      # Access Token 只负责短期 API 访问。普通退出不做 access token 黑名单，
+      # 因此这里默认缩短为 30 分钟，控制退出后的剩余可用窗口。
+      expires-in-seconds: ${JWT_EXPIRES_IN_SECONDS:1800}
+    auth-cache:
+      enabled: ${AUTH_USER_CACHE_ENABLED:true}
+      key-prefix: ${AUTH_USER_CACHE_KEY_PREFIX:ekb:auth:user:}
+      ttl-seconds: ${AUTH_USER_CACHE_TTL_SECONDS:300}
+      ttl-jitter-seconds: ${AUTH_USER_CACHE_TTL_JITTER_SECONDS:60}
+    refresh-token:
+      # Refresh Token 是 Redis 中真正可撤销的长期登录会话。
+      # key 中拼接的是 sha256(refreshToken)，不是明文 refresh token。
+      key-prefix: ${REFRESH_TOKEN_KEY_PREFIX:ekb:auth:refresh:}
+      # 用户维度集合暂时只用于维护索引，为后续退出全部设备/强制下线预留。
+      user-sessions-key-prefix: ${REFRESH_TOKEN_USER_SESSIONS_KEY_PREFIX:ekb:auth:user-refresh:}
+      expires-in-seconds: ${REFRESH_TOKEN_EXPIRES_IN_SECONDS:1209600}
+      token-bytes: ${REFRESH_TOKEN_BYTES:32}
+  knowledge:
+    access-cache:
+      enabled: ${KB_ACCESS_CACHE_ENABLED:true}
+      key-prefix: ${KB_ACCESS_CACHE_KEY_PREFIX:ekb:kb:meta:}
+      ttl-seconds: ${KB_ACCESS_CACHE_TTL_SECONDS:300}
+      ttl-jitter-seconds: ${KB_ACCESS_CACHE_TTL_JITTER_SECONDS:60}
+  ai-service:
+    base-url: http://localhost:8000
+    connect-timeout-ms: ${AI_SERVICE_CONNECT_TIMEOUT_MS:2000}
+    response-timeout-seconds: ${AI_SERVICE_RESPONSE_TIMEOUT_SECONDS:180}
+  storage:
+    minio:
+      endpoint: ${MINIO_ENDPOINT:http://localhost:9000}
+      access-key: ${MINIO_ACCESS_KEY}
+      secret-key: ${MINIO_SECRET_KEY}
+      bucket: ${MINIO_BUCKET:ekb-documents}
+  document:
+    status-timeout-check-interval-ms: ${DOCUMENT_STATUS_TIMEOUT_CHECK_INTERVAL_MS:60000}
+  indexing:
+    queue:
+      exchange-name: ${INDEXING_QUEUE_EXCHANGE:ekb.indexing.exchange}
+      queue-name: ${INDEXING_QUEUE_NAME:ekb.indexing.tasks}
+      routing-key: ${INDEXING_QUEUE_ROUTING_KEY:indexing.task}
+      dead-letter-exchange-name: ${INDEXING_QUEUE_DLX:ekb.indexing.dlx}
+      dead-letter-queue-name: ${INDEXING_QUEUE_DLQ:ekb.indexing.tasks.dlq}
+      dead-letter-routing-key: ${INDEXING_QUEUE_DLX_ROUTING_KEY:indexing.task.dead}
+      republish-interval-ms: ${INDEXING_QUEUE_REPUBLISH_INTERVAL_MS:30000}
+      republish-delay-seconds: ${INDEXING_QUEUE_REPUBLISH_DELAY_SECONDS:30}
+      republish-batch-size: ${INDEXING_QUEUE_REPUBLISH_BATCH_SIZE:20}
+      prefetch-count: ${INDEXING_QUEUE_PREFETCH_COUNT:1}
+      concurrent-consumers: ${INDEXING_QUEUE_CONCURRENT_CONSUMERS:1}
+      max-concurrent-consumers: ${INDEXING_QUEUE_MAX_CONCURRENT_CONSUMERS:1}
