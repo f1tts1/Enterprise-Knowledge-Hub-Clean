@@ -20,9 +20,19 @@ public class IndexingTask {
 
     private String status;
 
+    private Integer attemptNo;
+
+    private String triggerType;
+
     private Integer retryCount;
 
     private Integer maxRetry;
+
+    private String failureStage;
+
+    private Boolean retryable;
+
+    private LocalDateTime lastPublishAttemptAt;
 
     private String errorMessage;
 
@@ -74,6 +84,22 @@ public class IndexingTask {
         this.status = status;
     }
 
+    public Integer getAttemptNo() {
+        return attemptNo;
+    }
+
+    public void setAttemptNo(Integer attemptNo) {
+        this.attemptNo = attemptNo;
+    }
+
+    public String getTriggerType() {
+        return triggerType;
+    }
+
+    public void setTriggerType(String triggerType) {
+        this.triggerType = triggerType;
+    }
+
     public Integer getRetryCount() {
         return retryCount;
     }
@@ -88,6 +114,30 @@ public class IndexingTask {
 
     public void setMaxRetry(Integer maxRetry) {
         this.maxRetry = maxRetry;
+    }
+
+    public String getFailureStage() {
+        return failureStage;
+    }
+
+    public void setFailureStage(String failureStage) {
+        this.failureStage = failureStage;
+    }
+
+    public Boolean getRetryable() {
+        return retryable;
+    }
+
+    public void setRetryable(Boolean retryable) {
+        this.retryable = retryable;
+    }
+
+    public LocalDateTime getLastPublishAttemptAt() {
+        return lastPublishAttemptAt;
+    }
+
+    public void setLastPublishAttemptAt(LocalDateTime lastPublishAttemptAt) {
+        this.lastPublishAttemptAt = lastPublishAttemptAt;
     }
 
     public String getErrorMessage() {

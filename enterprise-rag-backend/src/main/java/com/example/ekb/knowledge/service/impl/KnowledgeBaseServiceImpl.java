@@ -3,6 +3,7 @@ package com.example.ekb.knowledge.service.impl;
 import java.util.List;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.example.ekb.common.constants.DocumentIndexStatus;
 import com.example.ekb.common.enums.ErrorCode;
 import com.example.ekb.common.exception.BusinessException;
 import com.example.ekb.common.response.PageResponse;
@@ -96,9 +97,12 @@ public class KnowledgeBaseServiceImpl implements KnowledgeBaseService {
     @Override
     @Transactional
     public void delete(Long currentUserId, Long knowledgeBaseId) {
-        KnowledgeBase knowledgeBase = getOwnedKnowledgeBase(currentUserId, knowledgeBaseId);
-        if (hasActiveDocuments(currentUserId, knowledgeBaseId)) {
-            throw new BusinessException(ErrorCode.CONFLICT, "Delete documents before deleting knowledge base");
+        KnowledgeBase knowledgeBase = knowledgeBaseAccessService.requireOwnedForWrite(currentUserId, knowledgeBaseId);
+        if (hasDocumentsPendingCleanup(currentUserId, knowledgeBaseId)) {
+            throw new BusinessException(
+                    ErrorCode.CONFLICT,
+                    "Delete all documents and finish failed cleanup before deleting knowledge base"
+            );
         }
 
         // 唯一索引包含 is_deleted，但如果删除后仍保留原 name，
@@ -120,11 +124,13 @@ public class KnowledgeBaseServiceImpl implements KnowledgeBaseService {
         return count != null && count > 0;
     }
 
-    private boolean hasActiveDocuments(Long ownerUserId, Long knowledgeBaseId) {
+    private boolean hasDocumentsPendingCleanup(Long ownerUserId, Long knowledgeBaseId) {
+        // DELETING/DELETE_FAILED 已经 is_deleted=1，但外部 Qdrant/MinIO 清理尚未完成。
+        // 仅检查逻辑删除位会让知识库先被删掉，失败文档随后从正常管理路径失联。
         Long count = documentMapper.selectCount(new LambdaQueryWrapper<Document>()
                 .eq(Document::getOwnerUserId, ownerUserId)
                 .eq(Document::getKbId, knowledgeBaseId)
-                .eq(Document::getIsDeleted, NOT_DELETED));
+                .ne(Document::getIndexStatus, DocumentIndexStatus.DELETED));
         return count != null && count > 0;
     }
 

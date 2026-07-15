@@ -6,6 +6,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 
@@ -16,6 +17,7 @@ import com.example.ekb.ai.dto.AiDocumentVectorDeleteRequest;
 import com.example.ekb.ai.dto.AiDocumentVectorDeleteResponse;
 import com.example.ekb.common.constants.DocumentIndexStatus;
 import com.example.ekb.common.constants.IndexingTaskStatus;
+import com.example.ekb.common.constants.IndexingTaskTriggerType;
 import com.example.ekb.common.enums.ErrorCode;
 import com.example.ekb.common.exception.BusinessException;
 import com.example.ekb.common.response.PageResponse;
@@ -35,6 +37,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -49,8 +53,9 @@ public class DocumentServiceImpl implements DocumentService {
     private static final int MAX_FILE_NAME_LENGTH = 255;
     private static final int MAX_ERROR_MESSAGE_LENGTH = 1000;
     private static final Set<String> ALLOWED_EXTENSIONS = Set.of("pdf", "docx", "txt", "md", "markdown");
-    private static final String DOCUMENT_DELETE_BUSY_MESSAGE = "Document is waiting for indexing or indexing now";
+    private static final String DOCUMENT_DELETE_BUSY_MESSAGE = "Document indexing or deletion is already in progress";
     private static final int DEFAULT_CHUNK_COUNT = 0;
+    private static final int DEFAULT_ATTEMPT_NO = 0;
     private static final int DEFAULT_RETRY_COUNT = 0;
     private static final int DEFAULT_MAX_RETRY = 3;
     private static final int NOT_DELETED = 0;
@@ -84,7 +89,9 @@ public class DocumentServiceImpl implements DocumentService {
     public DocumentResponse upload(Long currentUserId, Long knowledgeBaseId, MultipartFile file) {
         // 先校验知识库归属，再写对象存储，避免攻击者借用不属于自己的知识库
         // 向 MinIO 写入文件。
-        ensureOwnedKnowledgeBase(currentUserId, knowledgeBaseId);
+        // 上传和知识库删除必须锁定同一条 knowledge_base 记录，避免“删除检查完无文档”
+        // 与“上传即将插入文档”交错执行，留下挂在已删除知识库下的活动文档。
+        knowledgeBaseAccessService.requireOwnedForWrite(currentUserId, knowledgeBaseId);
         validateFile(file);
 
         String fileName = cleanFileName(file.getOriginalFilename());
@@ -119,7 +126,7 @@ public class DocumentServiceImpl implements DocumentService {
             );
             documentMapper.insert(document);
 
-            // document 行仍处于当前事务内，消费者只能在事务提交后的 Redis 消息里看到它。
+            // document 行仍处于当前事务内，RabbitMQ 消费者只能在事务提交后的消息里看到它。
             // 如果 MinIO 写入失败，事务会回滚，业务表不会留下指向缺失 object 的记录。
             storedObject = storageService.putObject(
                     objectKey,
@@ -127,9 +134,11 @@ public class DocumentServiceImpl implements DocumentService {
                     fileBytes.length,
                     contentType
             );
+            registerRollbackObjectCleanup(storedObject);
 
             IndexingTask indexingTask = buildIndexingTask(document);
             indexingTaskMapper.insert(indexingTask);
+            linkCurrentIndexingTask(document, indexingTask);
             // 上传接口只保证文件和任务已经落到 MySQL/MinIO，不同步等待索引。
             // IndexingService 会等当前 MySQL 事务提交后再投递 RabbitMQ；
             // 如果 RabbitMQ 暂时不可用，任务仍保持 PENDING，后续通过简单重试再投递。
@@ -182,14 +191,14 @@ public class DocumentServiceImpl implements DocumentService {
     @Override
     public DocumentIndexStatusResponse getIndexStatus(Long currentUserId, Long documentId) {
         Document document = getOwnedDocument(currentUserId, documentId);
-        return DocumentIndexStatusResponse.from(document, getLatestIndexingTask(document.getId()));
+        return DocumentIndexStatusResponse.from(document, getCurrentIndexingTask(document));
     }
 
     @Override
     @Transactional
     public DocumentIndexStatusResponse retryIndex(Long currentUserId, Long documentId) {
         Document document = getOwnedDocument(currentUserId, documentId);
-        IndexingTask indexingTask = getLatestIndexingTask(document.getId());
+        IndexingTask indexingTask = getCurrentIndexingTask(document);
         if (indexingTask == null) {
             throw new BusinessException(ErrorCode.CONFLICT, "Indexing task is missing");
         }
@@ -218,49 +227,41 @@ public class DocumentServiceImpl implements DocumentService {
             throw new BusinessException(ErrorCode.CONFLICT, "Only FAILED indexing tasks can be retried");
         }
 
-        // V1 的重试不新建任务历史、不引入重试状态机：
-        // 复用最新 FAILED 任务，把它重新置为 PENDING，再交给已有 RabbitMQ 消费。
-        // retry_count 只记录人工重试次数；max_retry 暂时作为展示字段，不阻断人工修复。
         int nextRetryCount = safeRetryCount(indexingTask) + 1;
+        if (nextRetryCount > safeMaxRetry(indexingTask)) {
+            throw new BusinessException(ErrorCode.CONFLICT, "Maximum indexing retries reached");
+        }
+
+        // 每次真正失败后的重试都创建不可变 attempt。旧 worker 即使迟到，也只能更新旧 task；
+        // document.current_indexing_task_id 是跨线程状态写入的 fencing token。
+        IndexingTask retryTask = buildRetryIndexingTask(document, indexingTask, nextRetryCount);
+        try {
+            indexingTaskMapper.insert(retryTask);
+        } catch (DuplicateKeyException ex) {
+            throw new BusinessException(ErrorCode.CONFLICT, "A newer indexing attempt already exists");
+        }
+
         int documentUpdated = documentMapper.update(null, new LambdaUpdateWrapper<Document>()
                 .eq(Document::getId, document.getId())
                 .eq(Document::getOwnerUserId, currentUserId)
                 .eq(Document::getIsDeleted, NOT_DELETED)
                 .eq(Document::getIndexStatus, DocumentIndexStatus.INDEX_FAILED)
+                .eq(Document::getCurrentIndexingTaskId, indexingTask.getId())
                 .set(Document::getIndexStatus, DocumentIndexStatus.PENDING_INDEX)
+                .set(Document::getCurrentIndexingTaskId, retryTask.getId())
                 .set(Document::getChunkCount, DEFAULT_CHUNK_COUNT)
                 .set(Document::getErrorMessage, null));
         if (documentUpdated == 0) {
             throw new BusinessException(ErrorCode.CONFLICT, "Document status changed before retrying index");
         }
 
-        int taskUpdated = indexingTaskMapper.update(null, new LambdaUpdateWrapper<IndexingTask>()
-                .eq(IndexingTask::getId, indexingTask.getId())
-                .eq(IndexingTask::getDocumentId, document.getId())
-                .eq(IndexingTask::getOwnerUserId, currentUserId)
-                .eq(IndexingTask::getStatus, IndexingTaskStatus.FAILED)
-                .set(IndexingTask::getStatus, IndexingTaskStatus.PENDING)
-                .set(IndexingTask::getRetryCount, nextRetryCount)
-                .set(IndexingTask::getErrorMessage, null)
-                .set(IndexingTask::getStartedAt, null)
-                .set(IndexingTask::getFinishedAt, null));
-        if (taskUpdated == 0) {
-            throw new BusinessException(ErrorCode.CONFLICT, "Indexing task status changed before retrying index");
-        }
-
-        // 这里复用上传后的投递方法：如果 RabbitMQ 暂时不可用，方法内部不会把任务打失败，
-        // task 会保持 PENDING，并由简单的 PENDING 重投定时器继续尝试。
-        indexingService.requestIndexingAfterUpload(document.getId(), indexingTask.getId());
+        indexingService.requestIndexingAfterUpload(document.getId(), retryTask.getId());
 
         document.setIndexStatus(DocumentIndexStatus.PENDING_INDEX);
+        document.setCurrentIndexingTaskId(retryTask.getId());
         document.setChunkCount(DEFAULT_CHUNK_COUNT);
         document.setErrorMessage(null);
-        indexingTask.setStatus(IndexingTaskStatus.PENDING);
-        indexingTask.setRetryCount(nextRetryCount);
-        indexingTask.setErrorMessage(null);
-        indexingTask.setStartedAt(null);
-        indexingTask.setFinishedAt(null);
-        return DocumentIndexStatusResponse.from(document, indexingTask);
+        return DocumentIndexStatusResponse.from(document, retryTask);
     }
 
     @Override
@@ -276,8 +277,12 @@ public class DocumentServiceImpl implements DocumentService {
             // 让业务状态保持简单，也避免索引线程和删除线程互相覆盖 MySQL 状态。
             throw new BusinessException(ErrorCode.DOCUMENT_BUSY, DOCUMENT_DELETE_BUSY_MESSAGE);
         }
+        if (!isDeleteStartable(document.getIndexStatus())) {
+            throw new BusinessException(ErrorCode.CONFLICT, "Document is not in a deletable state");
+        }
 
-        if (!markDeleting(document)) {
+        Integer deleteGeneration = markDeleting(document);
+        if (deleteGeneration == null) {
             Document latest = getOwnedDocumentForDelete(currentUserId, documentId);
             if (DocumentIndexStatus.DELETED.equals(latest.getIndexStatus())) {
                 return;
@@ -291,30 +296,34 @@ public class DocumentServiceImpl implements DocumentService {
         try {
             deleteDocumentVectors(document);
             deleteDocumentObject(document);
-            markDeleted(document);
+            markDeleted(document, deleteGeneration);
         } catch (BusinessException ex) {
-            markDeleteFailed(document, ex.getMessage());
+            markDeleteFailed(document, deleteGeneration, ex.getMessage());
             throw ex;
         } catch (RuntimeException ex) {
             String errorMessage = "Failed to delete document: " + readableMessage(ex);
-            markDeleteFailed(document, errorMessage);
+            markDeleteFailed(document, deleteGeneration, errorMessage);
             throw new BusinessException(ErrorCode.INTERNAL_ERROR, errorMessage);
         }
     }
 
-    private boolean markDeleting(Document document) {
+    private Integer markDeleting(Document document) {
         // MySQL 是唯一业务事实来源。删除开始时先把 document 改成 DELETING，
         // 并立刻设置 is_deleted=1：列表、详情、检索二次过滤都会把它视为不可见。
         // 这里不再更新 indexing_task；V1 通过 409 直接禁止索引中删除。
+        int currentGeneration = safeDeleteGeneration(document);
+        int nextGeneration = currentGeneration + 1;
         int updated = documentMapper.update(null, new LambdaUpdateWrapper<Document>()
                 .eq(Document::getId, document.getId())
                 .eq(Document::getOwnerUserId, document.getOwnerUserId())
-                .notIn(Document::getIndexStatus, deleteBusyStatuses())
-                .ne(Document::getIndexStatus, DocumentIndexStatus.DELETED)
+                .eq(Document::getDeleteGeneration, currentGeneration)
+                .eq(Document::getIndexStatus, document.getIndexStatus())
+                .in(Document::getIndexStatus, deleteStartStatuses())
                 .set(Document::getIsDeleted, DELETED)
                 .set(Document::getIndexStatus, DocumentIndexStatus.DELETING)
+                .set(Document::getDeleteGeneration, nextGeneration)
                 .set(Document::getErrorMessage, null));
-        return updated > 0;
+        return updated > 0 ? nextGeneration : null;
     }
 
     private void deleteDocumentVectors(Document document) {
@@ -326,6 +335,11 @@ public class DocumentServiceImpl implements DocumentService {
                             document.getOwnerUserId()
                     )
             );
+            if (response == null
+                    || !Objects.equals(document.getId(), response.documentId())
+                    || !"DELETED".equals(response.status())) {
+                throw new IllegalStateException("AI service returned an invalid document deletion result");
+            }
             log.info("Deleted Qdrant vectors for document delete, documentId={}, kbId={}, ownerUserId={}, status={}, collection={}, collectionExisted={}",
                     document.getId(),
                     document.getKbId(),
@@ -356,28 +370,45 @@ public class DocumentServiceImpl implements DocumentService {
         }
     }
 
-    private void markDeleted(Document document) {
-        documentMapper.update(null, new LambdaUpdateWrapper<Document>()
+    private void markDeleted(Document document, int deleteGeneration) {
+        int updated = documentMapper.update(null, new LambdaUpdateWrapper<Document>()
                 .eq(Document::getId, document.getId())
                 .eq(Document::getOwnerUserId, document.getOwnerUserId())
+                .eq(Document::getIndexStatus, DocumentIndexStatus.DELETING)
+                .eq(Document::getDeleteGeneration, deleteGeneration)
                 .set(Document::getIsDeleted, DELETED)
                 .set(Document::getIndexStatus, DocumentIndexStatus.DELETED)
                 .set(Document::getErrorMessage, null));
+        if (updated == 0) {
+            log.info("Ignored stale document deletion success, documentId={}, deleteGeneration={}",
+                    document.getId(), deleteGeneration);
+            throw new BusinessException(ErrorCode.CONFLICT, "Document deletion attempt is no longer current");
+        }
     }
 
-    private void markDeleteFailed(Document document, String errorMessage) {
+    private void markDeleteFailed(Document document, int deleteGeneration, String errorMessage) {
         // 删除失败仍保持 is_deleted=1，保证文档不会重新出现在列表或检索结果里。
         // error_message 记录最后一次失败原因，后续再次 DELETE 同一个 documentId 即可重试。
-        documentMapper.update(null, new LambdaUpdateWrapper<Document>()
+        int updated = documentMapper.update(null, new LambdaUpdateWrapper<Document>()
                 .eq(Document::getId, document.getId())
                 .eq(Document::getOwnerUserId, document.getOwnerUserId())
+                .eq(Document::getIndexStatus, DocumentIndexStatus.DELETING)
+                .eq(Document::getDeleteGeneration, deleteGeneration)
                 .set(Document::getIsDeleted, DELETED)
                 .set(Document::getIndexStatus, DocumentIndexStatus.DELETE_FAILED)
                 .set(Document::getErrorMessage, truncateErrorMessage(errorMessage)));
+        if (updated == 0) {
+            log.info("Ignored stale document deletion failure, documentId={}, deleteGeneration={}",
+                    document.getId(), deleteGeneration);
+        }
     }
 
     private boolean isDeleteBusy(String indexStatus) {
         return deleteBusyStatuses().contains(indexStatus);
+    }
+
+    private boolean isDeleteStartable(String indexStatus) {
+        return deleteStartStatuses().contains(indexStatus);
     }
 
     private Set<String> deleteBusyStatuses() {
@@ -386,7 +417,16 @@ public class DocumentServiceImpl implements DocumentService {
         // 避免删除线程与索引线程同时改写 document/indexing_task 状态。
         return Set.of(
                 DocumentIndexStatus.PENDING_INDEX,
-                DocumentIndexStatus.INDEXING
+                DocumentIndexStatus.INDEXING,
+                DocumentIndexStatus.DELETING
+        );
+    }
+
+    private Set<String> deleteStartStatuses() {
+        return Set.of(
+                DocumentIndexStatus.INDEXED,
+                DocumentIndexStatus.INDEX_FAILED,
+                DocumentIndexStatus.DELETE_FAILED
         );
     }
 
@@ -423,9 +463,41 @@ public class DocumentServiceImpl implements DocumentService {
         indexingTask.setKbId(document.getKbId());
         indexingTask.setOwnerUserId(document.getOwnerUserId());
         indexingTask.setStatus(IndexingTaskStatus.PENDING);
+        indexingTask.setAttemptNo(DEFAULT_ATTEMPT_NO);
+        indexingTask.setTriggerType(IndexingTaskTriggerType.UPLOAD);
         indexingTask.setRetryCount(DEFAULT_RETRY_COUNT);
         indexingTask.setMaxRetry(DEFAULT_MAX_RETRY);
         return indexingTask;
+    }
+
+    private IndexingTask buildRetryIndexingTask(
+            Document document,
+            IndexingTask previousTask,
+            int nextRetryCount
+    ) {
+        IndexingTask indexingTask = new IndexingTask();
+        indexingTask.setDocumentId(document.getId());
+        indexingTask.setKbId(document.getKbId());
+        indexingTask.setOwnerUserId(document.getOwnerUserId());
+        indexingTask.setStatus(IndexingTaskStatus.PENDING);
+        indexingTask.setAttemptNo(safeAttemptNo(previousTask) + 1);
+        indexingTask.setTriggerType(IndexingTaskTriggerType.MANUAL_RETRY);
+        indexingTask.setRetryCount(nextRetryCount);
+        indexingTask.setMaxRetry(safeMaxRetry(previousTask));
+        return indexingTask;
+    }
+
+    private void linkCurrentIndexingTask(Document document, IndexingTask indexingTask) {
+        int updated = documentMapper.update(null, new LambdaUpdateWrapper<Document>()
+                .eq(Document::getId, document.getId())
+                .eq(Document::getOwnerUserId, document.getOwnerUserId())
+                .eq(Document::getIndexStatus, DocumentIndexStatus.PENDING_INDEX)
+                .isNull(Document::getCurrentIndexingTaskId)
+                .set(Document::getCurrentIndexingTaskId, indexingTask.getId()));
+        if (updated == 0) {
+            throw new IllegalStateException("Failed to link the initial indexing attempt");
+        }
+        document.setCurrentIndexingTaskId(indexingTask.getId());
     }
 
     private void ensureOwnedKnowledgeBase(Long currentUserId, Long knowledgeBaseId) {
@@ -473,12 +545,15 @@ public class DocumentServiceImpl implements DocumentService {
         return count != null && count > 0;
     }
 
-    private IndexingTask getLatestIndexingTask(Long documentId) {
-        return indexingTaskMapper.selectOne(new LambdaQueryWrapper<IndexingTask>()
-                .eq(IndexingTask::getDocumentId, documentId)
-                .orderByDesc(IndexingTask::getCreatedAt)
-                .orderByDesc(IndexingTask::getId)
-                .last("LIMIT 1"));
+    private IndexingTask getCurrentIndexingTask(Document document) {
+        if (document.getCurrentIndexingTaskId() == null) {
+            return null;
+        }
+        IndexingTask task = indexingTaskMapper.selectById(document.getCurrentIndexingTaskId());
+        if (task == null || !Objects.equals(document.getId(), task.getDocumentId())) {
+            return null;
+        }
+        return task;
     }
 
     private void validateFile(MultipartFile file) {
@@ -580,6 +655,18 @@ public class DocumentServiceImpl implements DocumentService {
         return indexingTask.getRetryCount() == null ? 0 : indexingTask.getRetryCount();
     }
 
+    private int safeAttemptNo(IndexingTask indexingTask) {
+        return indexingTask.getAttemptNo() == null ? 0 : indexingTask.getAttemptNo();
+    }
+
+    private int safeMaxRetry(IndexingTask indexingTask) {
+        return indexingTask.getMaxRetry() == null ? DEFAULT_MAX_RETRY : indexingTask.getMaxRetry();
+    }
+
+    private int safeDeleteGeneration(Document document) {
+        return document.getDeleteGeneration() == null ? 0 : document.getDeleteGeneration();
+    }
+
     private String truncateErrorMessage(String errorMessage) {
         if (!StringUtils.hasText(errorMessage)) {
             return null;
@@ -601,5 +688,24 @@ public class DocumentServiceImpl implements DocumentService {
             log.warn("Failed to clean up uploaded object after document upload failure, objectKey={}",
                     storedObject.objectKey(), cleanupEx);
         }
+    }
+
+    private void registerRollbackObjectCleanup(StoredObject storedObject) {
+        if (storedObject == null || !TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCompletion(int status) {
+                // 只在数据库明确回滚时清理。STATUS_UNKNOWN 可能表示 commit 已在服务端成功、
+                // 但客户端没收到结果；此时删除 object 反而会制造已提交行指向缺失文件。
+                if (status == TransactionSynchronization.STATUS_ROLLED_BACK) {
+                    cleanupUploadedObject(storedObject);
+                } else if (status == TransactionSynchronization.STATUS_UNKNOWN) {
+                    log.warn("Document upload transaction outcome is unknown; keep object for reconciliation, objectKey={}",
+                            storedObject.objectKey());
+                }
+            }
+        });
     }
 }

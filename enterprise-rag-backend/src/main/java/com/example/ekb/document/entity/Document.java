@@ -30,6 +30,10 @@ public class Document {
 
     private String indexStatus;
 
+    private Long currentIndexingTaskId;
+
+    private Integer deleteGeneration;
+
     private Integer chunkCount;
 
     private String errorMessage;
@@ -118,6 +122,22 @@ public class Document {
 
     public void setIndexStatus(String indexStatus) {
         this.indexStatus = indexStatus;
+    }
+
+    public Long getCurrentIndexingTaskId() {
+        return currentIndexingTaskId;
+    }
+
+    public void setCurrentIndexingTaskId(Long currentIndexingTaskId) {
+        this.currentIndexingTaskId = currentIndexingTaskId;
+    }
+
+    public Integer getDeleteGeneration() {
+        return deleteGeneration;
+    }
+
+    public void setDeleteGeneration(Integer deleteGeneration) {
+        this.deleteGeneration = deleteGeneration;
     }
 
     public Integer getChunkCount() {

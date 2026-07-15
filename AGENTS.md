@@ -42,7 +42,7 @@ enterprise-rag-backend/
     user/        当前用户信息
     knowledge/   个人知识库 CRUD
     document/    文档上传、文档列表、文档详情、索引状态、状态驱动删除
-    indexing/    索引任务状态维护、RabbitMQ 生产和消费
+    indexing/    不可变索引 attempt、current task fencing、RabbitMQ 生产和消费
     retrieval/   知识库内向量检索入口，负责 Java 层权限校验
     rag/         最小同步 RAG 问答入口，复用检索并调用 Python 生成
     ai/          Java 调 Python AI 服务的 HTTP client 和 DTO
@@ -111,11 +111,16 @@ scripts/
 - 检索时 Java 必须先校验当前用户拥有知识库；Python 必须把 `ownerUserId + kbId` 下推到 Qdrant filter。
 - 上传文档后不能同步调用 Python；必须通过 RabbitMQ 形成异步边界。
 - RabbitMQ 消息只保存 `documentId` 和 `indexingTaskId`，消费者重新查 MySQL。
+- 消费者必须校验 task/document 的 `documentId + kbId + ownerUserId` 关联；非 current 的合法历史消息跳过，静态关联错误进入 DLQ。
 - 文件内容必须通过 MinIO 传递，Java 不把文件字节直接转发给 Python。
 - 当前索引状态由 MySQL 中 `document` 和 `indexing_task` 维护。
+- `indexing_task` 每个 attempt 单向流转；FAILED 业务重试必须新建 task，禁止把 FAILED task 重置为 PENDING。只有 PENDING 传输恢复允许重投同一 task。
+- `document.current_indexing_task_id` 是索引 document 状态更新的 fencing token，task 成功、失败和 timeout 都必须匹配 current task。
+- PENDING 发布重试必须通过 `last_publish_attempt_at` 做原子 claim 和时间节流；`max_retry` 必须实际生效。
 - 当前 `document.index_status` 只使用 `PENDING_INDEX`、`INDEXING`、`INDEXED`、`INDEX_FAILED`、`DELETING`、`DELETED`、`DELETE_FAILED`，不保留当前流程不会写入的预留状态。
 - Python 写 Qdrant 成功后只通过 DTO 汇报统计，不直接修改 MySQL。
 - 删除文档时 Java 负责业务状态流转，Python 只按 Java 传入的 `ownerUserId + kbId + docId` 清理 Qdrant vectors。
+- 删除成功、失败和超时必须匹配本次 `delete_generation`；旧删除调用不得覆盖新重试。
 - 当前同时提供向量检索接口和最小同步 RAG 问答接口；不得把 `retrieval/search` 单独描述成 RAG 问答能力。
 - RAG 问答必须复用 Java 检索服务完成知识库 owner 校验、Qdrant filter 检索和 MySQL 二次过滤后，再把 chunk context 传给 Python 生成。
 - Python RAG 生成接口只消费 Java 已过滤的上下文，不访问 MySQL，不自行判断完整用户权限。
@@ -130,14 +135,17 @@ cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub/enterprise-rag-b
 mysql -u root -p < src/main/resources/db/migration/V1__init_schema.sql
 ```
 
-注意：当前 SQL 文件开头包含 `Drop database enterprise_knowledge_hub;`，会删除本地已有数据。执行前必须确认这是本地测试库。
+注意：当前 SQL 文件开头包含 `DROP DATABASE IF EXISTS enterprise_knowledge_hub;`，会删除本地已有数据。执行前必须确认这是本地测试库。
 
-已有本地库升级时不要重跑 V1；按需执行非破坏性修复脚本：
+数据库初始化路径互斥：全新/可重置库只执行 V1（已含最终结构），不能再执行 V3；已有旧库不要重跑 V1，应先停应用并备份，再按需执行缺失迁移。V3 是一次性非幂等 DDL，失败后恢复备份，不直接重跑：
 
 ```bash
 cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub/enterprise-rag-backend"
 mysql -u root -p < src/main/resources/db/migration/V2__fix_document_active_checksum_index.sql
+mysql -u root -p < src/main/resources/db/migration/V3__add_indexing_attempt_and_deletion_fencing.sql
 ```
+
+V3 会在 DDL 前校验旧实现“每个 document 至多一条 indexing_task”的不变量，异常数据必须人工确认后再迁移。
 
 ### Java 编译
 

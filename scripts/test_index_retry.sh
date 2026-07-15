@@ -221,7 +221,7 @@ cat > "$DEMO_DOC" <<DOC
 唯一标记：${UNIQUE_MARKER}。
 Java 后端应该在 AI 服务不可用时把 document.index_status 写成 INDEX_FAILED，
 把 indexing_task.status 写成 FAILED。
-恢复 AI 服务后，调用 index-retry 应该让同一任务重新进入 PENDING 并最终写入 Qdrant。
+恢复 AI 服务后，调用 index-retry 应该创建新的 MANUAL_RETRY attempt 并最终写入 Qdrant。
 DOC
 
 echo "Java 后端地址: $BASE_URL"
@@ -262,6 +262,15 @@ echo "docId=$DOC_ID"
 wait_index_failed "$TOKEN" "$DOC_ID"
 echo "已验证失败态: document=INDEX_FAILED task=FAILED"
 
+FAILED_STATUS_RESPONSE="$(curl -sS "$BASE_URL/api/v1/documents/$DOC_ID/index-status" \
+  -H "Authorization: Bearer $TOKEN")"
+FAILED_TASK_ID="$(printf '%s' "$FAILED_STATUS_RESPONSE" | json_get "data.indexingTaskId")"
+FAILED_ATTEMPT_NO="$(printf '%s' "$FAILED_STATUS_RESPONSE" | json_get "data.attemptNo")"
+if [[ "$FAILED_ATTEMPT_NO" != "0" ]]; then
+  echo "初次上传应该是 attemptNo=0，实际为 $FAILED_ATTEMPT_NO" >&2
+  exit 1
+fi
+
 echo
 echo "==> 4. 恢复 FastAPI 后调用 index-retry"
 wait_ai_reachable
@@ -271,8 +280,20 @@ RETRY_RESPONSE="$(curl -sS -X POST "$BASE_URL/api/v1/documents/$DOC_ID/index-ret
 assert_success_response "$RETRY_RESPONSE" "重试索引"
 RETRY_DOC_STATUS="$(printf '%s' "$RETRY_RESPONSE" | json_get "data.documentIndexStatus")"
 RETRY_TASK_STATUS="$(printf '%s' "$RETRY_RESPONSE" | json_get "data.taskStatus")"
+RETRY_TASK_ID="$(printf '%s' "$RETRY_RESPONSE" | json_get "data.indexingTaskId")"
+RETRY_ATTEMPT_NO="$(printf '%s' "$RETRY_RESPONSE" | json_get "data.attemptNo")"
+RETRY_TRIGGER_TYPE="$(printf '%s' "$RETRY_RESPONSE" | json_get "data.triggerType")"
 RETRY_COUNT="$(printf '%s' "$RETRY_RESPONSE" | json_get "data.retryCount")"
-echo "重试入口返回: document=$RETRY_DOC_STATUS task=$RETRY_TASK_STATUS retryCount=$RETRY_COUNT"
+echo "重试入口返回: document=$RETRY_DOC_STATUS task=$RETRY_TASK_STATUS taskId=$RETRY_TASK_ID attemptNo=$RETRY_ATTEMPT_NO triggerType=$RETRY_TRIGGER_TYPE retryCount=$RETRY_COUNT"
+
+if [[ "$RETRY_TASK_ID" == "$FAILED_TASK_ID" ]]; then
+  echo "失败业务重试必须创建新 task，实际仍复用了 taskId=$RETRY_TASK_ID" >&2
+  exit 1
+fi
+if [[ "$RETRY_ATTEMPT_NO" != "1" || "$RETRY_TRIGGER_TYPE" != "MANUAL_RETRY" || "$RETRY_COUNT" != "1" ]]; then
+  echo "重试 attempt 元数据不符合预期: attemptNo=$RETRY_ATTEMPT_NO triggerType=$RETRY_TRIGGER_TYPE retryCount=$RETRY_COUNT" >&2
+  exit 1
+fi
 
 wait_index_completed "$TOKEN" "$DOC_ID"
 echo "已验证重试成功: document=INDEXED task=SUCCESS"

@@ -1,6 +1,6 @@
 # 项目状态
 
-更新时间：2026-06-29
+更新时间：2026-07-15
 
 本文档只记录当前仓库状态，不记录未来设想为已完成。
 
@@ -41,7 +41,8 @@
 - 查询当前用户知识库详情。
 - 逻辑删除知识库。
 - V1 权限模型：`owner_user_id` 私有归属。
-- 删除知识库前会检查是否存在未删除文档；如果存在，返回 `409 Conflict`，避免知识库删除后文档和 vectors 残留在不可解释状态。
+- 删除知识库前会检查是否存在任何未进入 `DELETED` 的文档；`DELETING` / `DELETE_FAILED` 虽已业务不可见仍会阻止删除，避免外部清理记录从正常管理路径失联。
+- 文档上传与知识库删除使用同一条 `knowledge_base` 行锁串行化，关闭“删除检查为空后并发插入文档”的窗口。
 - 删除知识库时将名称追加 `#deleted#id`，释放原名称唯一约束。
 - 已新增 Redis 知识库访问缓存：详情、文档入口、检索入口和 RAG 复用同一套 owner 校验服务，命中缓存时不再访问 `knowledge_base` 表。
 - 知识库访问缓存不缓存“某用户无权访问”的负结果；如果缓存命中但 owner 不匹配，仍返回 `KNOWLEDGE_BASE_NOT_FOUND`。
@@ -55,31 +56,36 @@
 - MySQL `document` 保存文件元数据、bucket、object_key、checksum。
 - 同一知识库内对未删除文档基于 SHA-256 去重；已删除历史记录保留原 checksum，但不再参与唯一冲突。
 - 上传流程先用 MySQL active checksum 唯一索引抢占文档，再写 MinIO object，避免同一知识库内并发上传同内容文件时失败请求留下重复 MinIO 对象。
+- MinIO 写入成功后注册事务完成回调；事务明确回滚时会尽力幂等删除本次 object。commit 结果为 UNKNOWN 时不会冒险删除，因为数据库可能已经提交；该情况记录告警并留给后续盘点。
 - 文档列表、文档详情、索引状态查询。
 - 文档删除采用 MySQL 状态驱动的最终一致性方案：先将文档置为 `DELETING` 且业务不可见，再删除 Qdrant vectors、删除 MinIO object，最后置为 `DELETED`。
 - 删除 Qdrant vectors 或 MinIO object 失败时，文档保持业务不可见并进入 `DELETE_FAILED`，可再次调用删除接口重试。
-- 文档处于 `PENDING_INDEX`、`INDEXING` 时，删除接口返回 `409004 DOCUMENT_BUSY`，V1 不支持同一文档同时索引和删除。
+- 每次删除执行窗口递增 `delete_generation`，成功、失败和超时更新都必须匹配本次 generation；旧删除调用不能覆盖新重试。
+- 文档处于 `PENDING_INDEX`、`INDEXING`、`DELETING` 时，删除接口返回 `409004 DOCUMENT_BUSY`，不允许索引/删除或两个删除调用并发推进。
 - `document.index_status` 当前只保留当前流程实际使用的 7 个状态，不保留未写入的预留上传状态。
 
 ### RabbitMQ 异步索引
 
-- 上传文档后创建 `indexing_task`。
+- 上传文档后创建 `attemptNo=0` 的不可变 `indexing_task`，并写入 `document.current_indexing_task_id`。
 - MySQL 事务提交后投递 RabbitMQ。
 - RabbitMQ exchange：`ekb.indexing.exchange`。
 - RabbitMQ queue：`ekb.indexing.tasks`。
 - RabbitMQ DLQ：`ekb.indexing.tasks.dlq`。
 - Java 使用 RabbitMQ listener 消费索引任务，手动 ack。
-- 消费者根据 RabbitMQ 消息中的 `documentId`、`indexingTaskId` 查询 MySQL。
+- 消费者根据 RabbitMQ 消息中的 `documentId`、`indexingTaskId` 查询 MySQL，并校验 task/document 的 id、知识库和 owner 关联。
+- 非 current 的历史 attempt 消息会 ack 并跳过；只有 `document.current_indexing_task_id` 指向的当前 task 可以推进 document 状态。
 - 消费者会跳过已删除文档；V1 通过删除接口的 409 busy 规则避免同一文档同时索引和删除。
 - Java 通过 WebClient 调用 Python 索引接口。
 - Spring Boot 启动时会声明 durable exchange、queue、DLX 和 DLQ。
 - 索引成功时更新 `document.index_status=INDEXED`、`indexing_task.status=SUCCESS`。
 - 索引失败时更新 `document.index_status=INDEX_FAILED`、`indexing_task.status=FAILED`。
-- RabbitMQ 投递失败时不再把任务标记失败，保留 `indexing_task.status=PENDING`，由简单 PENDING 任务重投器继续投递。
+- RabbitMQ 投递失败时不再把任务标记失败，保留 `indexing_task.status=PENDING`；PENDING 重投器先用 `last_publish_attempt_at` 做原子 claim 和时间节流，再尝试发布。
 - RabbitMQ 消息格式错误、消费者自身异常或未能正常落库的异常会进入 DLQ；Python 调用失败属于业务失败，会落库为 `FAILED` 并 ack。
 - 已提供索引失败后的人工重试入口：`POST /api/v1/documents/{documentId}/index-retry`。
 - `index-retry` 同时支持 `document=PENDING_INDEX`、`task=PENDING` 的手动重投场景，用于恢复 RabbitMQ 发布失败后尚未真正执行索引的任务；该路径不增加 `retry_count`。
-- 已提供简单超时标记：长时间停留在 `INDEXING`、`DELETING` 的文档会被标记为失败态，便于人工重试。
+- `INDEX_FAILED/FAILED` 的业务重试会新增 `MANUAL_RETRY` task，旧 FAILED task 永不复活；`attempt_no/retry_count` 单调递增，`max_retry=3` 已实际生效。
+- 索引 task 使用 `failure_stage`、`retryable` 记录最小失败分类；Python 未提供结构化错误码前，AI pipeline 的 retryable 保持未知。
+- 索引超时从 `RUNNING + started_at` 任务扫描，并在同一短事务内收口当前 task/document；删除超时按 `delete_generation` 条件更新。
 
 ### Redis 认证缓存
 
@@ -190,21 +196,19 @@
 ### 可靠性验证矩阵
 
 - 新增可靠性矩阵文档：`docs/RELIABILITY_MATRIX.md`。
-- 新增 RabbitMQ 重复消息幂等验证脚本：`scripts/test_indexing_duplicate_message.sh`。
-- 新增 RabbitMQ 发布失败后 PENDING 手动重投验证脚本：`scripts/test_pending_index_republish.sh`。
-- 新增并发上传与 Qdrant schema 初始化幂等验证脚本：`scripts/test_concurrent_document_upload.sh`。
-- 新增同一知识库并发同内容上传去重验证脚本：`scripts/test_concurrent_duplicate_upload.sh`。
-- 新增删除 busy 冲突验证脚本：`scripts/test_document_delete_busy.sh`。
+- 新增 20 个 P0-1 Java 单元测试，覆盖 immutable attempt、maxRetry、PENDING 同 attempt 重投、消息关联/current task、Python 响应 ID、发布 claim、timeout rollback 标记、删除 generation、事务回滚/UNKNOWN 清理语义和知识库写锁守卫等关键分支。
+- 已在 `/tmp` 隔离、禁用网络的 MySQL 9.5 临时实例验证：全新 V1、旧 V1→V2→V3、attempt 回填、legacy timeout 半状态归一化、历史时间戳保留、唯一约束，以及异常多 task preflight 在持久 DDL 前终止。未连接本地业务库。
 - 可靠性矩阵覆盖 RabbitMQ 重复消息、RabbitMQ 发布失败后的 PENDING 手动重投、FastAPI 不可用、人工重试、旧 worker 迟到返回、删除 busy、删除外部资源失败、同内容删除重传、并发同内容上传去重、Qdrant 删除残留防线、并发 Qdrant schema 初始化和权限隔离。
 - 当前已经有脚本覆盖索引失败人工重试、同内容文档重传删除、检索权限隔离、RAG 权限隔离和空知识库短路；部分外部依赖故障注入仍作为人工演练或设计保证记录。
-- 2026-06-29 已手动验证通过：同知识库并发同内容上传去重、Redis XADD 失败后 PENDING 手动重投、Redis Stream 重复消息幂等。
+- 2026-06-29 的 Redis XADD / Redis Stream 记录属于旧队列实现的历史证据，不能作为当前 RabbitMQ 代码的验证结论；对应旧脚本当前也不在仓库中。
 - 2026-07-09 已完成索引队列代码层替换：RabbitMQ exchange/queue/DLQ、手动 ack listener、PENDING 重投器已落地；RabbitMQ 故障脚本仍需在本地依赖启动后重新验证。
+- 2026-07-15 已落地 P0-1 状态机加固：不可变索引 attempt、current task fencing、消息关联校验、超时原子收口、PENDING 发布节流、删除 generation fencing，以及知识库删除/文档上传写路径串行化。
 
 ## 正在进行
 
 当前 Redis 使用已收敛为认证用户缓存、Redis Refresh Token 会话和知识库访问缓存；文档索引异步队列已切换为 RabbitMQ。后续如继续实现 Redis 场景，应优先考虑 RAG 限流，不应扩展为全量业务缓存。
 
-上传、索引、删除一致性简化阶段和最小同步 RAG 阶段已经落地到代码。当前实现收敛为 MySQL 状态、`indexing_task`、幂等重试、简单超时标记、Java 编排检索和 Python 生成；下一步应先提交稳定 checkpoint，而不是继续扩展新能力。
+P0-1 后端可靠性代码、契约文档、20 个单元测试和隔离 MySQL 迁移验证已经完成，当前等待本地 commit / PR 审查。代码完成不等于外部故障演练已经完成，RabbitMQ、慢 worker、Qdrant/MinIO 故障仍按实际证据单独记录。
 
 ## 尚未完成
 
@@ -214,7 +218,7 @@
 - query rewrite、hybrid search、rerank、context compression。
 - 基于评测结果的 chunk size、topK、相似度阈值对照实验。
 - 人工或 LLM judge 形式的答案正确性、忠实度细粒度评分。
-- RabbitMQ 发布失败、旧 worker 迟到返回、Qdrant/MinIO 删除失败的自动化故障注入脚本。
+- RabbitMQ 发布失败、旧 worker 迟到触碰 Qdrant、Qdrant/MinIO 删除失败的自动化外部故障注入脚本。
 - Agent 工作流。
 - Docker Compose 一键部署。
 - 完整 RBAC。
@@ -234,19 +238,19 @@
 
 而 `processIndexingTask` 内部会捕获 Python 调用异常并将任务标记为 `INDEX_FAILED` / `FAILED`，不会继续向外抛出。因此，如果 Python 调用失败，RabbitMQ 消息仍会被 ack，不依赖队列自动反复重试。
 
-这符合当前“失败落库可见 + 人工重试”的 V1 行为。失败任务不会依赖 MQ 自动重试，用户可通过 `POST /api/v1/documents/{documentId}/index-retry` 重新置为 `PENDING` 并投递。消息格式错误、消费者自身异常或未能正常落库的异常会被 `basicReject(requeue=false)` 投递到 DLQ。
+这符合当前“失败落库可见 + 人工重试”的行为。失败任务不会依赖 MQ 自动重试；用户调用 `POST /api/v1/documents/{documentId}/index-retry` 时会创建新的不可变 PENDING attempt，旧 FAILED task 保持终态。PENDING 传输恢复才会重投同一 task。消息格式错误、task/document 静态关联错误、消费者自身异常或未能正常落库的异常会被 `basicReject(requeue=false)` 投递到 DLQ。
 
 ### Qdrant vectors 或 MinIO 删除失败不做后台补偿
 
 当前删除文档会先把 MySQL `document` 置为 `DELETING` 且 `is_deleted=1`，再同步调用 Python 删除 Qdrant vectors，随后删除 MinIO object，最后置为 `DELETED`。
 
-如果 Qdrant 或 MinIO 删除失败，Java 会把文档置为 `DELETE_FAILED` 并保留 `is_deleted=1`，因此文档不会重新出现在列表或检索结果里。V1 不引入 outbox、补偿任务表或通用一致性协调器，重试方式是再次调用删除接口。
+如果 Qdrant 或 MinIO 删除失败，Java 会在本次 `delete_generation` 仍有效时把文档置为 `DELETE_FAILED` 并保留 `is_deleted=1`，因此文档不会重新出现在列表或检索结果里。当前不引入 outbox、补偿任务表或通用一致性协调器，重试方式是再次调用删除接口并认领新 generation。
 
 ### SQL 初始化脚本会删除数据库
 
-`V1__init_schema.sql` 第一行是 `Drop database enterprise_knowledge_hub;`。这适合本地重置演示环境，但不适合保留数据的开发库或任何生产环境。
+`V1__init_schema.sql` 第一行是 `DROP DATABASE IF EXISTS enterprise_knowledge_hub;`。这适合本地重置演示环境，但不适合保留数据的开发库或任何生产环境。
 
-已有本地库从旧版本升级时，应执行 `V2__fix_document_active_checksum_index.sql`，将 `document` 的 checksum 唯一约束修正为只约束未删除文档，避免同内容文件“删除 -> 重传 -> 再删除”时与历史 deleted 行冲突。
+初始化路径互斥：全新/可重置库只执行已包含最终结构的 V1；已有旧库才在停应用、备份后执行缺失的 V2/V3。V3 是一次性非幂等 DDL，失败时恢复备份而不是直接重跑。它会先拒绝同一 document 存在多条旧 task 的异常数据；正常旧库会按现有 `retry_count` 回填当前 attempt（不会伪造已丢失的历史行），补齐 current task / delete generation，并归一化旧非事务 timeout 留下的 `INDEX_FAILED/RUNNING` 或 `INDEXING/FAILED` 半状态。
 
 ### SQL 中有后续表但没有业务 API
 
@@ -264,10 +268,14 @@ RAG 生成接口需要可用 LLM 配置。可以显式设置 `LLM_PROVIDER=opena
 
 当前 Java WebClient response timeout 默认为 180 秒，适合本地首次加载模型，但没有针对索引和检索接口分别配置。
 
+### MySQL attempt fencing 不等于 Qdrant execution fencing
+
+`document.current_indexing_task_id` 能阻止旧 worker 覆盖 current MySQL 状态，但已经发出的旧 Python 调用无法被撤回。当前 Python 索引仍按 doc 删除旧 points，再用稳定 point id upsert；如果旧调用最后执行，可能覆盖或删除新 attempt 的 vectors。P0-1 明确保留这个跨存储残余风险，后续若解决需单独设计 task-aware vectors、current-attempt 检索过滤和旧版本清理，不能把当前实现描述成强一致。
+
 ## 下一步最优先任务
 
-最小 RAG 阶段完成后，下一步建议：
+P0-1 完成后的下一步：
 
-1. 提交一版稳定 checkpoint，边界是文档上传、异步索引、向量检索、删除清理和最小同步 RAG。
-2. 面试演示优先使用现有脚本和真实业务接口验证，不恢复 health 接口。
-3. 在同步 RAG 稳定前，不启动 SSE、Agent、复杂评测或多轮会话落库。
+1. 在一次性本地测试库执行 V3 迁移并做 attempt、timeout、delete generation 的定向故障演练。
+2. 完成 PR 审查和手动合并，再把本地 `main` 快进到合并提交。
+3. 在可靠性证据整理完成前，不启动 SSE、Agent、hybrid/rerank 或多轮会话等新功能。

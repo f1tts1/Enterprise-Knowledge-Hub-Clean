@@ -1,7 +1,7 @@
 -- Enterprise Knowledge Hub V1 schema.
 -- Target: MySQL 8.0+ / 9.x.
 -- Scope: V1 core business tables only. RBAC and tenant tables are intentionally postponed.
-Drop database enterprise_knowledge_hub;
+DROP DATABASE IF EXISTS enterprise_knowledge_hub;
 
 CREATE DATABASE IF NOT EXISTS enterprise_knowledge_hub
   DEFAULT CHARACTER SET utf8mb4
@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS document (
   object_key VARCHAR(512) NOT NULL,
   checksum_sha256 CHAR(64) NULL,
   index_status VARCHAR(32) NOT NULL DEFAULT 'PENDING_INDEX' COMMENT 'PENDING_INDEX, INDEXING, INDEXED, INDEX_FAILED, DELETING, DELETED, DELETE_FAILED',
+  current_indexing_task_id BIGINT UNSIGNED NULL COMMENT 'Current indexing attempt; used as a fencing token for late workers',
+  delete_generation INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Monotonic fencing token for document deletion attempts',
   chunk_count INT UNSIGNED NOT NULL DEFAULT 0,
   error_message TEXT NULL,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -66,6 +68,7 @@ CREATE TABLE IF NOT EXISTS document (
   KEY idx_doc_kb_id (kb_id),
   KEY idx_doc_owner_user_id (owner_user_id),
   KEY idx_doc_index_status (index_status),
+  KEY idx_doc_current_indexing_task_id (current_indexing_task_id),
   KEY idx_doc_object_key (object_key),
   KEY idx_doc_checksum_sha256 (checksum_sha256),
   CONSTRAINT fk_doc_kb FOREIGN KEY (kb_id) REFERENCES knowledge_base (id),
@@ -78,18 +81,25 @@ CREATE TABLE IF NOT EXISTS indexing_task (
   kb_id BIGINT UNSIGNED NOT NULL,
   owner_user_id BIGINT UNSIGNED NOT NULL,
   status VARCHAR(32) NOT NULL DEFAULT 'PENDING' COMMENT 'PENDING, RUNNING, SUCCESS, FAILED',
+  attempt_no INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0-based immutable indexing attempt number',
+  trigger_type VARCHAR(32) NOT NULL DEFAULT 'UPLOAD' COMMENT 'UPLOAD, MANUAL_RETRY',
   retry_count INT UNSIGNED NOT NULL DEFAULT 0,
   max_retry INT UNSIGNED NOT NULL DEFAULT 3,
+  failure_stage VARCHAR(32) NULL COMMENT 'PRECONDITION, AI_PIPELINE, TIMEOUT',
+  retryable TINYINT(1) NULL COMMENT 'Whether the failure is known to be retryable; NULL means unknown',
+  last_publish_attempt_at DATETIME(3) NULL COMMENT 'Last attempt to publish this pending task to RabbitMQ',
   error_message TEXT NULL,
   started_at DATETIME(3) NULL,
   finished_at DATETIME(3) NULL,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
+  UNIQUE KEY uk_task_document_attempt (document_id, attempt_no),
   KEY idx_task_document_id (document_id),
   KEY idx_task_kb_id (kb_id),
   KEY idx_task_owner_user_id (owner_user_id),
   KEY idx_task_status (status),
+  KEY idx_task_pending_publish (status, last_publish_attempt_at),
   KEY idx_task_created_at (created_at),
   CONSTRAINT fk_task_document FOREIGN KEY (document_id) REFERENCES document (id),
   CONSTRAINT fk_task_kb FOREIGN KEY (kb_id) REFERENCES knowledge_base (id),

@@ -49,6 +49,18 @@ public class KnowledgeBaseAccessService {
         return knowledgeBase;
     }
 
+    /**
+     * 写路径绕过正向缓存并锁定知识库行。上传文档与删除知识库在各自事务里调用该方法，
+     * 共享同一把数据库行锁，避免“无文档检查”和“新文档插入”之间的竞态。
+     */
+    public KnowledgeBase requireOwnedForWrite(Long currentUserId, Long knowledgeBaseId) {
+        KnowledgeBase knowledgeBase = knowledgeBaseMapper.selectOwnedForUpdate(currentUserId, knowledgeBaseId);
+        if (knowledgeBase == null) {
+            throw new BusinessException(ErrorCode.KNOWLEDGE_BASE_NOT_FOUND);
+        }
+        return knowledgeBase;
+    }
+
     public void evict(Long knowledgeBaseId) {
         accessCache.evict(knowledgeBaseId);
     }
