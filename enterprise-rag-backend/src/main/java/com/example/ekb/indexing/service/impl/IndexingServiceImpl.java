@@ -1,12 +1,14 @@
 package com.example.ekb.indexing.service.impl;
 
 import java.time.LocalDateTime;
+import java.util.Objects;
 
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.example.ekb.ai.client.AiDocumentIndexClient;
 import com.example.ekb.ai.dto.AiDocumentIndexRequest;
 import com.example.ekb.ai.dto.AiDocumentIndexResponse;
 import com.example.ekb.common.constants.DocumentIndexStatus;
+import com.example.ekb.common.constants.IndexingFailureStage;
 import com.example.ekb.common.constants.IndexingTaskStatus;
 import com.example.ekb.document.entity.Document;
 import com.example.ekb.document.mapper.DocumentMapper;
@@ -76,8 +78,18 @@ public class IndexingServiceImpl implements IndexingService {
         Document document = documentMapper.selectById(documentId);
         IndexingTask indexingTask = indexingTaskMapper.selectById(indexingTaskId);
         if (document == null || indexingTask == null) {
-            log.warn("Skip indexing because document or task is missing, documentId={}, taskId={}",
-                    documentId, indexingTaskId);
+            throw new IllegalArgumentException(
+                    "Indexing message references a missing document or task: documentId=%s, taskId=%s"
+                            .formatted(documentId, indexingTaskId)
+            );
+        }
+
+        validateMessageAssociation(document, indexingTask, documentId, indexingTaskId);
+        if (!Objects.equals(document.getCurrentIndexingTaskId(), indexingTask.getId())) {
+            // 消息可能已经成功入队，但用户随后为失败文档创建了新 attempt。
+            // 旧消息是正常的 at-least-once 现象，确认并忽略即可，不能送进 DLQ 反复告警。
+            log.info("Skip stale indexing message, documentId={}, messageTaskId={}, currentTaskId={}",
+                    documentId, indexingTaskId, document.getCurrentIndexingTaskId());
             return;
         }
 
@@ -88,7 +100,12 @@ public class IndexingServiceImpl implements IndexingService {
         }
 
         if (isDeleted(document)) {
-            markTaskFailed(indexingTask, DOCUMENT_DELETED_BEFORE_INDEXING);
+            markTaskFailed(
+                    indexingTask,
+                    DOCUMENT_DELETED_BEFORE_INDEXING,
+                    IndexingFailureStage.PRECONDITION,
+                    false
+            );
             log.info("Skip indexing because document was already deleted, documentId={}, taskId={}",
                     documentId, indexingTaskId);
             return;
@@ -104,7 +121,7 @@ public class IndexingServiceImpl implements IndexingService {
             // Python 只接收 AI 服务需要的 DTO：对象存储位置、文档 id、
             // 归属元数据和 checksum。完整权限逻辑仍由 Java 掌握。
             AiDocumentIndexResponse response = aiDocumentIndexClient.indexDocument(toAiRequest(document, indexingTask));
-            ensureIndexed(response);
+            ensureIndexed(response, document, indexingTask);
             log.info("AI indexing task indexed, documentId={}, taskId={}, aiStatus={}, pageCount={}, charCount={}, chunkCount={}, embeddedChunkCount={}, indexedChunkCount={}, vectorDim={}, vectorStore={}, vectorCollection={}, embeddingProvider={}, embeddingModel={}, message={}",
                     document.getId(),
                     indexingTask.getId(),
@@ -122,12 +139,23 @@ public class IndexingServiceImpl implements IndexingService {
                     response.message());
             markSucceeded(document, indexingTask, response);
         } catch (RuntimeException ex) {
-            markFailed(document, indexingTask, ex);
+            markFailed(document, indexingTask, ex, IndexingFailureStage.AI_PIPELINE, null);
         }
     }
 
     private void publishToQueue(IndexingQueueMessage message) {
         try {
+            LocalDateTime publishAttemptAt = LocalDateTime.now();
+            int claimed = indexingTaskMapper.update(null, new LambdaUpdateWrapper<IndexingTask>()
+                    .eq(IndexingTask::getId, message.indexingTaskId())
+                    .eq(IndexingTask::getDocumentId, message.documentId())
+                    .eq(IndexingTask::getStatus, IndexingTaskStatus.PENDING)
+                    .set(IndexingTask::getLastPublishAttemptAt, publishAttemptAt));
+            if (claimed == 0) {
+                log.info("Skip publishing indexing task because it is no longer pending, documentId={}, taskId={}",
+                        message.documentId(), message.indexingTaskId());
+                return;
+            }
             indexingQueueProducer.publish(message);
         } catch (RuntimeException ex) {
             // 这里通常发生在 RabbitMQ 没启动、网络断开、exchange/queue 不可用等场景。
@@ -144,14 +172,19 @@ public class IndexingServiceImpl implements IndexingService {
             // RUNNING/INDEXING 表示 Java 即将把文件交给 Python。
             // 这还不代表 Qdrant 中已经存在向量；向量写入成功后才会进入 INDEXED/SUCCESS。
             //
-            // V1 不再引入额外重试中间态：人工重试时把失败任务重新置为 PENDING 即可。
+            // 人工重试会创建新的 PENDING attempt；历史 task 永不复活。
             // 这里用条件更新保证重复 RabbitMQ 消息不会把 SUCCESS/FAILED 任务拉回 RUNNING。
             int taskUpdated = indexingTaskMapper.update(null, new LambdaUpdateWrapper<IndexingTask>()
                     .eq(IndexingTask::getId, indexingTask.getId())
+                    .eq(IndexingTask::getDocumentId, document.getId())
+                    .eq(IndexingTask::getKbId, document.getKbId())
+                    .eq(IndexingTask::getOwnerUserId, document.getOwnerUserId())
                     .eq(IndexingTask::getStatus, IndexingTaskStatus.PENDING)
                     .set(IndexingTask::getStatus, IndexingTaskStatus.RUNNING)
                     .set(IndexingTask::getStartedAt, LocalDateTime.now())
                     .set(IndexingTask::getFinishedAt, null)
+                    .set(IndexingTask::getFailureStage, null)
+                    .set(IndexingTask::getRetryable, null)
                     .set(IndexingTask::getErrorMessage, null));
             if (taskUpdated == 0) {
                 return false;
@@ -161,12 +194,20 @@ public class IndexingServiceImpl implements IndexingService {
             // is_deleted 置为 1，任务会在同一事务内收口到 FAILED。
             int documentUpdated = documentMapper.update(null, new LambdaUpdateWrapper<Document>()
                     .eq(Document::getId, document.getId())
+                    .eq(Document::getKbId, document.getKbId())
+                    .eq(Document::getOwnerUserId, document.getOwnerUserId())
                     .eq(Document::getIsDeleted, NOT_DELETED)
                     .eq(Document::getIndexStatus, DocumentIndexStatus.PENDING_INDEX)
+                    .eq(Document::getCurrentIndexingTaskId, indexingTask.getId())
                     .set(Document::getIndexStatus, DocumentIndexStatus.INDEXING)
                     .set(Document::getErrorMessage, null));
             if (documentUpdated == 0) {
-                markTaskFailedInCurrentTransaction(indexingTask, DOCUMENT_DELETED_BEFORE_INDEXING);
+                markTaskFailedInCurrentTransaction(
+                        indexingTask,
+                        DOCUMENT_DELETED_BEFORE_INDEXING,
+                        IndexingFailureStage.PRECONDITION,
+                        false
+                );
                 return false;
             }
             return true;
@@ -174,7 +215,13 @@ public class IndexingServiceImpl implements IndexingService {
         return Boolean.TRUE.equals(updated);
     }
 
-    private void markFailed(Document document, IndexingTask indexingTask, RuntimeException ex) {
+    private void markFailed(
+            Document document,
+            IndexingTask indexingTask,
+            RuntimeException ex,
+            String failureStage,
+            Boolean retryable
+    ) {
         // task 和 document 都保存错误信息：前端可以直接展示文档级失败，
         // 排查问题时也可以查看任务历史。
         String errorMessage = truncate(StringUtils.hasText(ex.getMessage())
@@ -182,20 +229,32 @@ public class IndexingServiceImpl implements IndexingService {
                 : ex.getClass().getSimpleName());
 
         Boolean updated = transactionTemplate.execute(status -> {
-            int taskUpdated = markRunningTaskFailedInCurrentTransaction(indexingTask, errorMessage);
+            int taskUpdated = markRunningTaskFailedInCurrentTransaction(
+                    indexingTask,
+                    errorMessage,
+                    failureStage,
+                    retryable
+            );
             if (taskUpdated == 0) {
                 return false;
             }
 
             // 只允许仍处于 INDEXING 的文档被当前 worker 写成 INDEX_FAILED。
-            // 如果超时调度器已经把任务打失败，或者用户已经发起重试并把任务重新置为 PENDING，
+            // 如果超时调度器已经把任务打失败，或者用户已经发起重试并切换到新 attempt，
             // 旧 worker 的迟到异常不能覆盖新的业务状态。
-            documentMapper.update(null, new LambdaUpdateWrapper<Document>()
+            int documentUpdated = documentMapper.update(null, new LambdaUpdateWrapper<Document>()
                     .eq(Document::getId, document.getId())
+                    .eq(Document::getKbId, document.getKbId())
+                    .eq(Document::getOwnerUserId, document.getOwnerUserId())
                     .eq(Document::getIsDeleted, NOT_DELETED)
                     .eq(Document::getIndexStatus, DocumentIndexStatus.INDEXING)
+                    .eq(Document::getCurrentIndexingTaskId, indexingTask.getId())
                     .set(Document::getIndexStatus, DocumentIndexStatus.INDEX_FAILED)
                     .set(Document::getErrorMessage, errorMessage));
+            if (documentUpdated == 0) {
+                status.setRollbackOnly();
+                return false;
+            }
             return true;
         });
 
@@ -208,30 +267,49 @@ public class IndexingServiceImpl implements IndexingService {
                 document.getId(), indexingTask.getId());
     }
 
-    private void markTaskFailed(IndexingTask indexingTask, String errorMessage) {
+    private void markTaskFailed(
+            IndexingTask indexingTask,
+            String errorMessage,
+            String failureStage,
+            Boolean retryable
+    ) {
         transactionTemplate.executeWithoutResult(status ->
-                markTaskFailedInCurrentTransaction(indexingTask, errorMessage));
+                markTaskFailedInCurrentTransaction(indexingTask, errorMessage, failureStage, retryable));
     }
 
-    private void markTaskFailedInCurrentTransaction(IndexingTask indexingTask, String errorMessage) {
+    private void markTaskFailedInCurrentTransaction(
+            IndexingTask indexingTask,
+            String errorMessage,
+            String failureStage,
+            Boolean retryable
+    ) {
         // 失败态只允许从未完成状态进入，不能覆盖 SUCCESS，也不能覆盖其它线程已经写入的 FAILED。
-        // 重试不需要额外中间态，后续人工重试直接把 task 重新置为 PENDING。
+        // 失败任务保持不可变终态；后续人工重试会新增 task attempt。
         indexingTaskMapper.update(null, new LambdaUpdateWrapper<IndexingTask>()
                 .eq(IndexingTask::getId, indexingTask.getId())
                 .in(IndexingTask::getStatus, IndexingTaskStatus.PENDING, IndexingTaskStatus.RUNNING)
                 .set(IndexingTask::getStatus, IndexingTaskStatus.FAILED)
+                .set(IndexingTask::getFailureStage, failureStage)
+                .set(IndexingTask::getRetryable, retryable)
                 .set(IndexingTask::getErrorMessage, truncate(errorMessage))
                 .set(IndexingTask::getFinishedAt, LocalDateTime.now()));
     }
 
-    private int markRunningTaskFailedInCurrentTransaction(IndexingTask indexingTask, String errorMessage) {
+    private int markRunningTaskFailedInCurrentTransaction(
+            IndexingTask indexingTask,
+            String errorMessage,
+            String failureStage,
+            Boolean retryable
+    ) {
         // 外部 AI 调用返回时，只能更新仍属于本次执行窗口的 RUNNING 任务。
-        // 超时后人工重试会把同一 task 重新置为 PENDING；旧 worker 如果迟到返回，
-        // 这里必须 no-op，避免把新的重试状态重新打成 FAILED。
+        // 超时后人工重试会创建新 task；旧 worker 如果迟到返回，
+        // 这里与 document.current_indexing_task_id 共同阻止它覆盖新 attempt。
         return indexingTaskMapper.update(null, new LambdaUpdateWrapper<IndexingTask>()
                 .eq(IndexingTask::getId, indexingTask.getId())
                 .eq(IndexingTask::getStatus, IndexingTaskStatus.RUNNING)
                 .set(IndexingTask::getStatus, IndexingTaskStatus.FAILED)
+                .set(IndexingTask::getFailureStage, failureStage)
+                .set(IndexingTask::getRetryable, retryable)
                 .set(IndexingTask::getErrorMessage, truncate(errorMessage))
                 .set(IndexingTask::getFinishedAt, LocalDateTime.now()));
     }
@@ -244,8 +322,13 @@ public class IndexingServiceImpl implements IndexingService {
             // 检索入口仍以 MySQL 的 INDEXED 状态为准，不返回半完成或已删除文档。
             int taskUpdated = indexingTaskMapper.update(null, new LambdaUpdateWrapper<IndexingTask>()
                     .eq(IndexingTask::getId, indexingTask.getId())
+                    .eq(IndexingTask::getDocumentId, document.getId())
+                    .eq(IndexingTask::getKbId, document.getKbId())
+                    .eq(IndexingTask::getOwnerUserId, document.getOwnerUserId())
                     .eq(IndexingTask::getStatus, IndexingTaskStatus.RUNNING)
                     .set(IndexingTask::getStatus, IndexingTaskStatus.SUCCESS)
+                    .set(IndexingTask::getFailureStage, null)
+                    .set(IndexingTask::getRetryable, null)
                     .set(IndexingTask::getErrorMessage, null)
                     .set(IndexingTask::getFinishedAt, LocalDateTime.now()));
             if (taskUpdated == 0) {
@@ -256,8 +339,11 @@ public class IndexingServiceImpl implements IndexingService {
             // 只有仍处于 INDEXING 的文档，才属于当前 RUNNING 任务的执行窗口。
             int documentUpdated = documentMapper.update(null, new LambdaUpdateWrapper<Document>()
                     .eq(Document::getId, document.getId())
+                    .eq(Document::getKbId, document.getKbId())
+                    .eq(Document::getOwnerUserId, document.getOwnerUserId())
                     .eq(Document::getIsDeleted, NOT_DELETED)
                     .eq(Document::getIndexStatus, DocumentIndexStatus.INDEXING)
+                    .eq(Document::getCurrentIndexingTaskId, indexingTask.getId())
                     .set(Document::getIndexStatus, DocumentIndexStatus.INDEXED)
                     .set(Document::getChunkCount, response.chunkCount())
                     .set(Document::getErrorMessage, null));
@@ -287,12 +373,20 @@ public class IndexingServiceImpl implements IndexingService {
         );
     }
 
-    private void ensureIndexed(AiDocumentIndexResponse response) {
+    private void ensureIndexed(
+            AiDocumentIndexResponse response,
+            Document document,
+            IndexingTask indexingTask
+    ) {
         // V2 的成功标准是 INDEXED：Python 已经完成解析、切分、embedding，
         // 并且 Qdrant upsert 成功。CHUNKED/EMBEDDED 仍可能出现在直接调试
         // Python 接口的场景，但对 Java 的“文档索引任务”来说还不是成功。
         if (response == null || !DocumentIndexStatus.INDEXED.equals(response.status())) {
             throw new IllegalStateException("AI service did not finish Qdrant indexing");
+        }
+        if (!Objects.equals(indexingTask.getId(), response.taskId())
+                || !Objects.equals(document.getId(), response.documentId())) {
+            throw new IllegalStateException("AI service returned an indexing result for another task or document");
         }
         if (response.chunkCount() == null || response.indexedChunkCount() == null) {
             throw new IllegalStateException("AI service did not return chunk indexing counts");
@@ -318,5 +412,21 @@ public class IndexingServiceImpl implements IndexingService {
 
     private boolean isTaskProcessable(IndexingTask indexingTask) {
         return IndexingTaskStatus.PENDING.equals(indexingTask.getStatus());
+    }
+
+    private void validateMessageAssociation(
+            Document document,
+            IndexingTask indexingTask,
+            Long messageDocumentId,
+            Long messageTaskId
+    ) {
+        boolean valid = Objects.equals(document.getId(), messageDocumentId)
+                && Objects.equals(indexingTask.getId(), messageTaskId)
+                && Objects.equals(indexingTask.getDocumentId(), document.getId())
+                && Objects.equals(indexingTask.getKbId(), document.getKbId())
+                && Objects.equals(indexingTask.getOwnerUserId(), document.getOwnerUserId());
+        if (!valid) {
+            throw new IllegalArgumentException("Indexing message does not match task/document ownership");
+        }
     }
 }

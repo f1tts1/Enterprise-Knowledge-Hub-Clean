@@ -296,7 +296,8 @@ Authorization: Bearer <accessToken>
 
 当前行为：
 
-- 如果知识库下仍有未删除文档，返回 `409 Conflict`，要求先删除文档。
+- 如果知识库下仍有任何未进入 `DELETED` 的文档，返回 `409 Conflict`。这包括业务上已不可见但外部资源尚未清理完成的 `DELETING` / `DELETE_FAILED` 文档。
+- 删除知识库与上传文档会锁定同一条 `knowledge_base` 记录；删除检查和文档插入被串行化，不能在已删除知识库下并发插入活动文档。
 - 逻辑删除知识库。
 - 将知识库状态改为 `ARCHIVED`。
 - 将名称追加 `#deleted#id`，释放原名称唯一约束。
@@ -348,8 +349,10 @@ file=<PDF/DOCX/TXT/MD/Markdown 文件>
 
 1. Java 上传文件到 MinIO。
 2. Java 写入 `document`。
-3. Java 写入 `indexing_task`。
-4. MySQL 事务提交后，Java 向 RabbitMQ 写入索引任务消息。
+3. Java 创建 `attemptNo=0`、`triggerType=UPLOAD` 的 `indexing_task`，并将其 id 写入 `document.current_indexing_task_id`。
+4. MySQL 事务提交后，Java 向 RabbitMQ 写入当前索引 attempt 的任务消息。
+
+`indexingTaskId` 始终表示 `document.current_indexing_task_id` 指向的当前 attempt；列表和详情接口也返回该值。
 
 ### 查询知识库文档列表
 
@@ -375,7 +378,7 @@ Authorization: Bearer <accessToken>
       "indexStatus": "INDEXED",
       "chunkCount": 3,
       "errorMessage": null,
-      "indexingTaskId": null,
+      "indexingTaskId": 1,
       "createdAt": "2026-06-15T10:00:00",
       "updatedAt": "2026-06-15T10:00:00"
     }
@@ -414,14 +417,20 @@ Authorization: Bearer <accessToken>
   "documentErrorMessage": null,
   "indexingTaskId": 1,
   "taskStatus": "SUCCESS",
+  "attemptNo": 0,
+  "triggerType": "UPLOAD",
   "retryCount": 0,
   "maxRetry": 3,
+  "failureStage": null,
+  "retryable": null,
   "taskErrorMessage": null,
   "startedAt": "2026-06-15T10:00:01",
   "finishedAt": "2026-06-15T10:00:10",
   "updatedAt": "2026-06-15T10:00:10"
 }
 ```
+
+这里只读取 `document.current_indexing_task_id` 指向的任务，不再按创建时间猜测“最新任务”。`maxRetry=3` 表示最多允许三次失败后的人工重试；初始 attempt 不计入该上限。`failureStage` 和 `retryable` 用于诊断，不作为当前重试接口的自动准入条件。
 
 ### 重试文档索引
 
@@ -433,11 +442,10 @@ Authorization: Bearer <accessToken>
 当前行为：
 
 - 只允许当前用户重试自己的文档。
-- 允许 `document.index_status=PENDING_INDEX` 且最新 `indexing_task.status=PENDING` 的文档手动重投 RabbitMQ 消息。
-- `PENDING_INDEX/PENDING` 手动重投不增加 `retry_count`，因为任务还没有真正执行失败。
-- 允许 `document.index_status=INDEX_FAILED` 且最新 `indexing_task.status=FAILED` 的文档重试。
-- 失败重试时将文档重新置为 `PENDING_INDEX`，将任务重新置为 `PENDING`，`retry_count + 1`，并清空错误信息、`started_at`、`finished_at`。
-- 重试复用现有 RabbitMQ 投递逻辑；如果 RabbitMQ 暂时不可用，任务保持 `PENDING`，由 PENDING 任务重投器继续投递。
+- 允许 `document.index_status=PENDING_INDEX` 且当前 `indexing_task.status=PENDING` 的文档手动重投 RabbitMQ 消息。这属于传输恢复：复用同一不可变 attempt，不增加 `attemptNo` 或 `retryCount`，也不创建新 task。
+- 允许 `document.index_status=INDEX_FAILED` 且当前 `indexing_task.status=FAILED` 的文档重试。这属于业务重试：旧 FAILED task 永久保留，新建 `triggerType=MANUAL_RETRY` 的 task，令 `attemptNo + 1`、`retryCount + 1`，再通过 CAS 将 `document.current_indexing_task_id` 切换到新 task。
+- `retryCount >= maxRetry` 时拒绝继续创建 attempt，返回 `409 Conflict`；并发重试或 current task 已变化时也返回 `409 Conflict`。
+- 如果 RabbitMQ 暂时不可用，当前新 attempt 保持 `PENDING`，由带发布节流的 PENDING 任务重投器继续投递。
 - 如果文档处于 `INDEXING`，返回 `409004 DOCUMENT_BUSY`。
 - 如果文档不是可重投或可重试状态，返回 `409 Conflict`。
 
@@ -452,12 +460,14 @@ Authorization: Bearer <accessToken>
 
 当前行为：
 
-- 如果文档处于 `PENDING_INDEX`、`INDEXING`，返回 `409004 DOCUMENT_BUSY`，V1 不支持同一文档同时索引和删除。
+- 如果文档处于 `PENDING_INDEX`、`INDEXING` 或 `DELETING`，返回 `409004 DOCUMENT_BUSY`；同一文档不能同时索引和删除，也不能并发启动两个删除调用。
 - 先将 MySQL `document` 置为 `DELETING` 且 `is_deleted=1`，使文档立即对列表、详情和检索不可见。
+- 每次从可删除状态进入 `DELETING` 时递增内部 `delete_generation`。`DELETED` / `DELETE_FAILED` 终态更新必须同时匹配本次 generation 和 `DELETING` 状态。
 - 同步调用 Python 内部接口，按 `ownerUserId + kbId + docId` 删除 Qdrant vectors。
 - 删除 MinIO object。对象不存在时视为成功。
 - 全部删除完成后，将 `document.index_status` 置为 `DELETED`。
 - 如果 Qdrant 或 MinIO 删除失败，文档保持 `is_deleted=1` 并进入 `DELETE_FAILED`，再次调用删除接口可重试。
+- `DELETE_FAILED` 重试会认领新的 generation；旧调用迟到成功或失败都不能覆盖新一轮删除状态。generation 不暴露到公开 API。
 - 删除后的历史记录不再参与 checksum 去重唯一约束，因此同一知识库可以再次上传同内容文件，并且后续删除不会与历史 deleted 行冲突。
 
 ### 知识库内向量检索
@@ -826,6 +836,13 @@ uk_doc_kb_active_checksum (kb_id, active_checksum_sha256)
 - 已删除历史行仍保留真实 `checksum_sha256`，便于排查和审计。
 - 上传流程先插入 `document` 抢占 active checksum，再写 MinIO object，避免并发同内容上传时失败请求先生成孤儿 object。
 
+### 索引 attempt 与删除 fencing
+
+- `uk_task_document_attempt (document_id, attempt_no)` 保证同一文档同一 attempt 只能创建一次。
+- `document.current_indexing_task_id` 是当前索引执行窗口的 fencing token；只有该 task 可以推进 document 状态。
+- `indexing_task.last_publish_attempt_at` 记录最近一次 RabbitMQ 发布尝试，用于 PENDING 扫描的延迟 claim；它不表示 broker 已经成功接收或消费消息。
+- `document.delete_generation` 是单调递增的删除执行窗口；删除成功、失败和超时都只能更新被自己认领的 generation。
+
 ## Java 与 Python 通信协议
 
 ### RabbitMQ 索引任务消息
@@ -845,8 +862,8 @@ deadLetterRoutingKey: indexing.task.dead
 
 ```json
 {
-  "documentId": "1",
-  "indexingTaskId": "1"
+  "documentId": 1,
+  "indexingTaskId": 1
 }
 ```
 
@@ -854,6 +871,8 @@ deadLetterRoutingKey: indexing.task.dead
 
 - RabbitMQ 消息只保存 ID。
 - Java 消费者重新查 MySQL 获取 bucket、objectKey、文件名、checksum。
+- 消费者校验 task 的 `documentId + kbId + ownerUserId` 与 document 一致；静态关联错误作为非法消息进入 DLQ。
+- 合法但不再等于 `document.current_indexing_task_id` 的旧 attempt 消息会 ack 并跳过；只有当前 `PENDING` attempt 可以进入 `RUNNING`。
 - Java 消费者正常处理后手动 ack；消费者自身异常或非法消息进入 DLQ。
 - Python 不访问 MySQL。
 
@@ -906,6 +925,7 @@ deadLetterRoutingKey: indexing.task.dead
 
 Java 成功状态要求：
 
+- 响应 `task_id`、`document_id` 必须与本次 current attempt 和 document 一致。
 - `status` 必须为 `INDEXED`。
 - `chunk_count` 必须大于 0。
 - `indexed_chunk_count` 必须大于 0。
@@ -987,6 +1007,7 @@ SQL 注释定义：
 说明：
 
 - 检索结果返回前只认可 `INDEXED` 且 `is_deleted=0` 的文档。
+- attempt fencing 保护的是 MySQL 当前业务状态。已经发出的旧 Python 调用仍可能触碰 Qdrant；稳定 point id 只能提供幂等覆盖，若旧调用最后执行，仍可能覆盖或删除 current attempt 的 vectors。P0-1 不解决该跨存储残余风险，也不宣称向量库具备强一致 fencing。
 
 ### indexing_task.status
 
@@ -999,10 +1020,12 @@ SQL 注释定义：
 
 当前代码实际写入：
 
-- `PENDING`：上传后创建任务，或索引失败后人工重试。
+- `PENDING`：某个新 attempt 等待消费，或同一 PENDING attempt 等待传输重投。
 - `RUNNING`：Java 消费任务并开始调用 Python。
 - `SUCCESS`：Python 已完成 Qdrant 写入，Java 已确认写入数量。
 - `FAILED`：索引调用失败、响应不符合契约、文档删除或索引超时。
+
+每个 task 只做单向状态流转，`FAILED` 不再回到 `PENDING`。失败后的人工重试创建新 task：`attempt_no` 从 0 开始单调递增，`trigger_type` 为 `UPLOAD` 或 `MANUAL_RETRY`；失败诊断使用 `failure_stage=PRECONDITION|AI_PIPELINE|TIMEOUT` 和可空的 `retryable`。
 
 ### chat_message.role
 

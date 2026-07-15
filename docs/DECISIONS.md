@@ -225,7 +225,7 @@
 原因：
 
 - 当前阶段优先让失败状态对用户和调试者可见。
-- 当前已提供人工重试入口，将失败文档和失败任务重新置为 `PENDING_INDEX` / `PENDING` 后复用 RabbitMQ。
+- 当前已提供人工重试入口：失败文档进入新执行窗口时创建新的 PENDING task，旧 FAILED task 保持不可变终态，再复用 RabbitMQ 投递边界。
 - 如果任务还停留在 `document=PENDING_INDEX`、`indexing_task=PENDING`，说明它尚未真正执行失败；同一入口只手动重投 RabbitMQ 消息，不增加 `retry_count`。
 
 放弃方案：
@@ -240,8 +240,9 @@
 
 - Java 仍然是业务状态主边界，删除文档必须先让 MySQL 中的文档对用户不可见。
 - Python 不访问 MySQL，也不维护业务删除状态，只负责执行向量库物理清理。
-- V1 不支持同一文档同时索引和删除。文档处于 `PENDING_INDEX`、`INDEXING` 时，删除接口返回 `409004 DOCUMENT_BUSY`。
+- 当前不支持同一文档同时索引和删除，也不允许两个删除调用并发执行。文档处于 `PENDING_INDEX`、`INDEXING`、`DELETING` 时，删除接口返回 `409004 DOCUMENT_BUSY`。
 - Qdrant、MinIO 和 MySQL 当前没有分布式事务；删除失败时进入 `DELETE_FAILED` 并保持 `is_deleted=1`，用户再次调用删除接口即可幂等重试。
+- 每次进入 `DELETING` 都递增 `delete_generation`；成功、失败和超时只能更新本 generation，防止迟到调用覆盖新一轮删除。
 
 放弃方案：
 
@@ -256,11 +257,11 @@
 
 - 上传接口只保证文件已保存、`document` 已创建、`indexing_task` 已创建；索引异步执行。
 - RabbitMQ 消息只保存 `documentId` 和 `indexingTaskId`，消费者重新查 MySQL。
-- RabbitMQ 发布失败时不把任务打失败，任务保持 `PENDING`，由简单 PENDING 重投器再次投递，也支持通过 `/index-retry` 手动重投。
+- RabbitMQ 发布失败时不把任务打失败，任务保持 `PENDING`，由带 `last_publish_attempt_at` claim 的 PENDING 重投器再次投递，也支持通过 `/index-retry` 手动重投同一 attempt。
 - 索引成功状态是 `document.index_status=INDEXED` 和 `indexing_task.status=SUCCESS`。
-- 索引失败状态是 `document.index_status=INDEX_FAILED` 和 `indexing_task.status=FAILED`，支持人工重试。
+- 索引失败状态是 `document.index_status=INDEX_FAILED` 和当前 `indexing_task.status=FAILED`；人工重试新建 task attempt，并用 `document.current_indexing_task_id` 切换当前执行窗口。
 - 删除失败状态是 `DELETE_FAILED`，文档保持 `is_deleted=1`，再次 DELETE 可幂等重试。
-- 长时间停留在 `INDEXING`、`DELETING` 的文档由简单超时标记器改为失败态，不自动补偿外部系统。
+- 长时间 RUNNING 的当前索引 task 与 INDEXING document 在同一短事务内改为失败态；DELETING 超时按 `delete_generation` 条件更新，不自动补偿外部系统。
 - Qdrant point id 由 `documentId + chunkIndex` 确定性生成；重复 upsert 覆盖同一 point。
 
 原因：
@@ -404,3 +405,30 @@
 - 暂不缓存文档列表。原因是索引状态、删除状态和分页共同影响结果，失效复杂。
 - 暂不缓存检索结果或 RAG 答案。原因是权限、文档版本、Qdrant 残留和 LLM 输出都会影响正确性。
 - 暂不使用布隆过滤器或缓存无权访问结果。原因是当前没有大量随机 kbId 穿透证据，缓存负权限还容易引入 stale deny。
+
+## D23：区分 PENDING 传输恢复与 FAILED 业务重试，并使用 execution fencing
+
+决策：索引 task 采用 append-only attempt。初次上传创建 `attempt_no=0, trigger_type=UPLOAD`；只有 PENDING 传输恢复可以重投同一 task，FAILED 业务重试必须创建 `MANUAL_RETRY` task。`document.current_indexing_task_id` 是索引状态写入的 fencing token，`document.delete_generation` 是删除终态的 fencing token。
+
+当前约束：
+
+- `(document_id, attempt_no)` 唯一约束阻止并发创建同一后继 attempt。
+- `retry_count/max_retry` 保持 API 兼容并真正执行三次人工重试上限。
+- RabbitMQ 消息仍只保存 `documentId + indexingTaskId`；消费者重新查库并校验 task/document 的 document、kb、owner 关联。
+- 非 current 的合法历史消息按 at-least-once 语义 ack 跳过；静态关联错误进入 DLQ。
+- task/document 的 RUNNING、SUCCESS、FAILED 和 timeout 更新采用同一锁顺序和短事务；document CAS 必须匹配 current task。
+- PENDING 扫描器先原子更新 `last_publish_attempt_at` 再发布，即使发布失败也等待下一节流窗口。
+- 删除不持有跨 Qdrant/MinIO 的长事务；每次删除只认领一个 generation，迟到结果只能 no-op。
+- 文档上传与知识库删除锁定同一 `knowledge_base` 行，避免删除检查与新文档插入交错。
+- MinIO put 成功后注册 transaction synchronization；只有明确 ROLLED_BACK 才按 objectKey 幂等清理。commit outcome 为 UNKNOWN 时仅告警并保留 object，避免误删已经提交业务行对应的文件。
+
+原因：
+
+- 复用同一 taskId 会让超时前的旧 worker 与重试后的新 worker 共享 RUNNING 标识，旧结果可能误写新的执行窗口。
+- 将“消息没发出去”和“AI 执行失败”区分开，既保留 at-least-once 恢复能力，也保留失败历史和可解释的 attempt 证据。
+- generation/token 是针对当前真实竞态的局部设计，比引入通用状态机、分布式锁、Saga 或 outbox 更符合项目规模。
+
+边界：
+
+- MySQL fencing 不能撤回已经发出的 Python HTTP 调用，也不宣称阻止旧 worker 触碰 Qdrant。稳定 point id 只提供幂等覆盖；旧调用若最后执行，仍可能覆盖或删除 current vectors。
+- 当前不实现自动指数退避业务重试、通用补偿平台或 task-aware Qdrant point 版本。

@@ -22,7 +22,7 @@ public record DocumentResponse(
 ) {
 
     public static DocumentResponse from(Document document) {
-        return from(document, null);
+        return from(document, document.getCurrentIndexingTaskId());
     }
 
     public static DocumentResponse from(Document document, Long indexingTaskId) {

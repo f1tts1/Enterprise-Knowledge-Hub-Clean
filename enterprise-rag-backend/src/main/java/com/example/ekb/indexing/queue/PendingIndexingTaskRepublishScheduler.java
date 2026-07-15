@@ -4,6 +4,7 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.example.ekb.common.constants.DocumentIndexStatus;
 import com.example.ekb.common.constants.IndexingTaskStatus;
 import com.example.ekb.document.entity.Document;
@@ -49,6 +50,11 @@ public class PendingIndexingTaskRepublishScheduler {
         List<IndexingTask> tasks = indexingTaskMapper.selectList(new LambdaQueryWrapper<IndexingTask>()
                 .eq(IndexingTask::getStatus, IndexingTaskStatus.PENDING)
                 .lt(IndexingTask::getCreatedAt, threshold)
+                .and(wrapper -> wrapper
+                        .isNull(IndexingTask::getLastPublishAttemptAt)
+                        .or()
+                        .lt(IndexingTask::getLastPublishAttemptAt, threshold))
+                .orderByAsc(IndexingTask::getLastPublishAttemptAt)
                 .orderByAsc(IndexingTask::getCreatedAt)
                 .orderByAsc(IndexingTask::getId)
                 .last("LIMIT " + Math.max(1, properties.getRepublishBatchSize())));
@@ -69,9 +75,29 @@ public class PendingIndexingTaskRepublishScheduler {
             return;
         }
 
-        if (!isWaitingForIndex(document)) {
+        if (!isWaitingForIndex(document)
+                || !task.getId().equals(document.getCurrentIndexingTaskId())
+                || !task.getKbId().equals(document.getKbId())
+                || !task.getOwnerUserId().equals(document.getOwnerUserId())) {
             log.info("Skip pending indexing task republish because document is not waiting for index, taskId={}, documentId={}, documentStatus={}, isDeleted={}",
                     task.getId(), task.getDocumentId(), document.getIndexStatus(), document.getIsDeleted());
+            return;
+        }
+
+        LocalDateTime claimedAt = LocalDateTime.now();
+        LambdaUpdateWrapper<IndexingTask> claim = new LambdaUpdateWrapper<IndexingTask>()
+                .eq(IndexingTask::getId, task.getId())
+                .eq(IndexingTask::getDocumentId, task.getDocumentId())
+                .eq(IndexingTask::getStatus, IndexingTaskStatus.PENDING);
+        if (task.getLastPublishAttemptAt() == null) {
+            claim.isNull(IndexingTask::getLastPublishAttemptAt);
+        } else {
+            claim.eq(IndexingTask::getLastPublishAttemptAt, task.getLastPublishAttemptAt());
+        }
+        claim.set(IndexingTask::getLastPublishAttemptAt, claimedAt);
+        if (indexingTaskMapper.update(null, claim) == 0) {
+            log.info("Skip pending indexing task republish because another publisher claimed it, taskId={}, documentId={}",
+                    task.getId(), task.getDocumentId());
             return;
         }
 
