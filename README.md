@@ -24,12 +24,14 @@ Spring Boot 上传文档
 
 当前也已落地 P0-2 基础可观测性：同步请求的 `X-Request-Id` 会从 Java 传播到 FastAPI 和外部 LLM；异步索引 attempt 使用稳定的 `index-task-{indexingTaskId}`；Python 返回索引、检索和 LLM 阶段耗时与 provider usage；Java 记录低基数 Micrometer 指标，并以 best-effort 方式写入 `model_call_log`。这些能力用于定位一次调用慢或失败在哪一段，不代表已经具备 Grafana 看板、告警、长期指标存储或正式 RAG 评测平台。
 
+P0-3 将“可靠性设计”收敛为可复现证据：Java 测试覆盖迟到 worker、timeout、Qdrant/MinIO 删除失败和 generation fencing；交互式脚本覆盖 RabbitMQ 停机恢复、重复消息、DLQ，以及 Qdrant/MinIO 删除失败恢复。仓库严格区分“自动测试通过、脚本已就绪、外部演练通过”，不会把脚本存在描述成真实依赖故障已经验证。
+
 ## 目录
 
 - `enterprise-rag-backend`：Spring Boot 业务后端。
 - `rag-ai-service`：FastAPI AI 服务。
 - `docs`：当前架构、状态、决策和 API 契约。
-- `scripts`：模型下载、权限检索测试等辅助脚本。
+- `scripts`：模型下载、固定测试 fixture、权限/RAG 回归和可靠性故障演练脚本。
 
 ## 本地运行
 
@@ -172,7 +174,34 @@ cd enterprise-rag-backend && mvn -q -o test && cd ..
 ./scripts/test_document_reupload_delete.sh
 ```
 
-`test_index_retry.sh` 需要按提示临时停止并恢复 FastAPI。RabbitMQ 发布失败、重复消息和并发故障场景当前记录为手工步骤或待补脚本，不把不存在的脚本列作证据。完整场景矩阵见 `docs/RELIABILITY_MATRIX.md`。
+`test_index_retry.sh` 需要按提示临时停止并恢复 FastAPI。P0-3 的外部依赖演练单独执行：
+
+```bash
+cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub"
+
+# RabbitMQ management API 默认使用 localhost:15672。
+# 交互读取密码，避免把明文写入 shell history。
+printf 'RabbitMQ username: '
+IFS= read -r RABBITMQ_USERNAME
+printf 'RabbitMQ password: '
+IFS= read -r -s RABBITMQ_PASSWORD
+printf '\n'
+export RABBITMQ_USERNAME RABBITMQ_PASSWORD
+MYSQL_DEFAULTS_FILE="$HOME/.my-ekb.cnf" ./scripts/test_rabbitmq_reliability.sh
+
+# Qdrant 与 MinIO 两种失败顺序需要分别演练。
+MYSQL_DEFAULTS_FILE="$HOME/.my-ekb.cnf" \
+./scripts/test_document_delete_failure_recovery.sh qdrant
+
+MYSQL_DEFAULTS_FILE="$HOME/.my-ekb.cnf" \
+./scripts/test_document_delete_failure_recovery.sh minio
+```
+
+`MYSQL_DEFAULTS_FILE` 应是本机权限受限的 MySQL client 配置文件，不要提交仓库。RabbitMQ 凭证会写入本次演练的权限受限临时 curl 配置，并在脚本退出时清理，不会出现在 curl 参数中。故障脚本不会猜测容器名或自动停服务，会提示操作者分阶段停止/恢复对应本地依赖；脚本只读取固定业务状态，不执行修复 SQL。
+
+如果演练中途断言失败，先按脚本警告恢复被停止的依赖，再排查业务状态。RabbitMQ 脚本为验证 DLQ 会保留一条非法消息，不会自动 purge 可能属于其他排障任务的死信。
+
+`scripts/test_retrieval_permission.sh` 和 `scripts/test_rag_permission.sh` 使用仓库内 `scripts/fixtures/retrieval-permission`，新 clone 不再依赖本地 `/tmp` 文件。完整场景、当前证据等级和尚未执行的外部演练见 `docs/RELIABILITY_MATRIX.md`。
 
 ## 重要文档
 

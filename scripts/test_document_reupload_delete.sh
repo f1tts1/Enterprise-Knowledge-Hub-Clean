@@ -11,10 +11,12 @@ BASE_URL="${BASE_URL:-http://localhost:8080}"
 RUN_ID="$(date +%Y%m%d%H%M%S)_$$"
 USERNAME="doc_reupload_${RUN_ID}"
 PASSWORD="Password123"
-DEMO_DOC="$(mktemp "${TMPDIR:-/tmp}/ekb-reupload-delete.XXXXXX.txt")"
+TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ekb-reupload-delete.XXXXXX")"
+DEMO_DOC="$TEMP_DIR/reupload-delete.txt"
 
 cleanup() {
   rm -f "$DEMO_DOC"
+  rmdir "$TEMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 

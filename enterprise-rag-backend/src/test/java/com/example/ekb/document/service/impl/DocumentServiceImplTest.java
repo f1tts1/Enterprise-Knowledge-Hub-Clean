@@ -7,6 +7,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -313,6 +314,87 @@ class DocumentServiceImplTest {
         assertDeletionFence(failureWrapper, 1);
     }
 
+    @Test
+    void deleteKeepsDocumentHiddenWhenQdrantCleanupFails() {
+        Document indexedDocument = document(DocumentIndexStatus.INDEXED);
+        when(documentMapper.selectOne(any())).thenReturn(indexedDocument);
+        when(documentMapper.update(isNull(), any(Wrapper.class))).thenReturn(1);
+        when(aiDocumentVectorDeleteClient.deleteDocumentVectors(any()))
+                .thenThrow(new IllegalStateException("qdrant unavailable"));
+
+        assertThatThrownBy(() -> documentService.delete(OWNER_USER_ID, DOCUMENT_ID))
+                .isInstanceOfSatisfying(BusinessException.class, ex -> {
+                    assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.AI_SERVICE_UNAVAILABLE);
+                    assertThat(ex.getMessage())
+                            .isEqualTo("Failed to delete Qdrant vectors: qdrant unavailable");
+                });
+
+        verify(aiDocumentVectorDeleteClient).deleteDocumentVectors(any());
+        verify(storageService, never()).removeObject(anyString());
+        assertDeleteFailedTransition(0, 1,
+                "Failed to delete Qdrant vectors: qdrant unavailable");
+    }
+
+    @Test
+    void deleteKeepsDocumentHiddenWhenMinioCleanupFails() {
+        Document indexedDocument = document(DocumentIndexStatus.INDEXED);
+        when(documentMapper.selectOne(any())).thenReturn(indexedDocument);
+        when(documentMapper.update(isNull(), any(Wrapper.class))).thenReturn(1);
+        when(aiDocumentVectorDeleteClient.deleteDocumentVectors(any())).thenReturn(validDeleteResponse());
+        doThrow(new IllegalStateException("minio unavailable"))
+                .when(storageService).removeObject(indexedDocument.getObjectKey());
+
+        assertThatThrownBy(() -> documentService.delete(OWNER_USER_ID, DOCUMENT_ID))
+                .isInstanceOfSatisfying(BusinessException.class, ex -> {
+                    assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.STORAGE_OPERATION_FAILED);
+                    assertThat(ex.getMessage())
+                            .isEqualTo("Failed to delete MinIO object: minio unavailable");
+                });
+
+        verify(aiDocumentVectorDeleteClient).deleteDocumentVectors(any());
+        verify(storageService).removeObject(indexedDocument.getObjectKey());
+        assertDeleteFailedTransition(0, 1,
+                "Failed to delete MinIO object: minio unavailable");
+    }
+
+    @Test
+    void deleteRetriesDeleteFailedDocumentWithNextGeneration() {
+        Document failedDocument = document(DocumentIndexStatus.DELETE_FAILED);
+        failedDocument.setIsDeleted(1);
+        failedDocument.setDeleteGeneration(4);
+        when(documentMapper.selectOne(any())).thenReturn(failedDocument);
+        when(documentMapper.update(isNull(), any(Wrapper.class))).thenReturn(1);
+        when(aiDocumentVectorDeleteClient.deleteDocumentVectors(any())).thenReturn(validDeleteResponse());
+
+        documentService.delete(OWNER_USER_ID, DOCUMENT_ID);
+
+        verify(aiDocumentVectorDeleteClient).deleteDocumentVectors(any());
+        verify(storageService).removeObject(failedDocument.getObjectKey());
+
+        ArgumentCaptor<Wrapper> updateWrapperCaptor = ArgumentCaptor.forClass(Wrapper.class);
+        verify(documentMapper, times(2)).update(isNull(), updateWrapperCaptor.capture());
+        List<Wrapper> updateWrappers = updateWrapperCaptor.getAllValues();
+        LambdaUpdateWrapper<?> claimWrapper = lambdaUpdateWrapper(updateWrappers.get(0));
+        LambdaUpdateWrapper<?> terminalWrapper = lambdaUpdateWrapper(updateWrappers.get(1));
+
+        assertDeletionFence(claimWrapper, 4);
+        assertThat(claimWrapper.getSqlSet())
+                .contains("is_deleted")
+                .contains("index_status")
+                .contains("delete_generation")
+                .contains("error_message");
+        assertThat(claimWrapper.getParamNameValuePairs().values())
+                .contains(DocumentIndexStatus.DELETE_FAILED, DocumentIndexStatus.DELETING, 5, 1);
+
+        assertDeletionFence(terminalWrapper, 5);
+        assertThat(terminalWrapper.getSqlSet())
+                .contains("is_deleted")
+                .contains("index_status")
+                .contains("error_message");
+        assertThat(terminalWrapper.getParamNameValuePairs().values())
+                .contains(DocumentIndexStatus.DELETING, DocumentIndexStatus.DELETED, 1);
+    }
+
     private static Stream<Arguments> mismatchedDeleteResponses() {
         return Stream.of(
                 Arguments.of(new AiDocumentVectorDeleteResponse(
@@ -396,6 +478,35 @@ class DocumentServiceImplTest {
                 .contains("delete_generation")
                 .contains("index_status");
         assertThat(wrapper.getParamNameValuePairs()).containsValue(generation);
+    }
+
+    private void assertDeleteFailedTransition(
+            int previousGeneration,
+            int currentGeneration,
+            String errorMessage
+    ) {
+        ArgumentCaptor<Wrapper> updateWrapperCaptor = ArgumentCaptor.forClass(Wrapper.class);
+        verify(documentMapper, times(2)).update(isNull(), updateWrapperCaptor.capture());
+        List<Wrapper> updateWrappers = updateWrapperCaptor.getAllValues();
+        LambdaUpdateWrapper<?> claimWrapper = lambdaUpdateWrapper(updateWrappers.get(0));
+        LambdaUpdateWrapper<?> failureWrapper = lambdaUpdateWrapper(updateWrappers.get(1));
+
+        assertDeletionFence(claimWrapper, previousGeneration);
+        assertThat(claimWrapper.getSqlSet())
+                .contains("is_deleted")
+                .contains("index_status")
+                .contains("delete_generation")
+                .contains("error_message");
+        assertThat(claimWrapper.getParamNameValuePairs().values())
+                .contains(1, DocumentIndexStatus.DELETING, currentGeneration);
+
+        assertDeletionFence(failureWrapper, currentGeneration);
+        assertThat(failureWrapper.getSqlSet())
+                .contains("is_deleted")
+                .contains("index_status")
+                .contains("error_message");
+        assertThat(failureWrapper.getParamNameValuePairs().values())
+                .contains(1, DocumentIndexStatus.DELETE_FAILED, errorMessage);
     }
 
     private Document document(String indexStatus) {

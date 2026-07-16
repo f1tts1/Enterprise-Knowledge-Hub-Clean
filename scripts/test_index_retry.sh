@@ -13,11 +13,13 @@ AI_SERVICE_URL="${AI_SERVICE_URL:-http://localhost:8000}"
 RUN_ID="$(date +%Y%m%d%H%M%S)"
 USERNAME="retry_test_$RUN_ID"
 PASSWORD="Password123"
-DEMO_DOC="$(mktemp "${TMPDIR:-/tmp}/ekb-index-retry.XXXXXX.txt")"
+TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ekb-index-retry.XXXXXX")"
+DEMO_DOC="$TEMP_DIR/index-retry.txt"
 UNIQUE_MARKER="INDEX_RETRY_MARKER_$RUN_ID"
 
 cleanup() {
   rm -f "$DEMO_DOC"
+  rmdir "$TEMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 

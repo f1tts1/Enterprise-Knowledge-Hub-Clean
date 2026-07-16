@@ -13,12 +13,14 @@ AI_SERVICE_URL="${AI_SERVICE_URL:-http://localhost:8000}"
 RUN_ID="$(date +%Y%m%d%H%M%S)_$$"
 USERNAME="rag_ask_${RUN_ID}"
 PASSWORD="Password123"
-DEMO_DOC="$(mktemp "${TMPDIR:-/tmp}/ekb-rag-ask.XXXXXX.txt")"
+TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ekb-rag-ask.XXXXXX")"
+DEMO_DOC="$TEMP_DIR/rag-ask.txt"
 UNIQUE_MARKER="RAG_ASK_MARKER_${RUN_ID}"
 EXPECTED_FACT="玄武湖项目使用 RabbitMQ 承担文档上传后的异步索引队列"
 
 cleanup() {
   rm -f "$DEMO_DOC"
+  rmdir "$TEMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 

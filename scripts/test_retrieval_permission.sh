@@ -21,7 +21,7 @@ set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8080}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DOC_DIR="$ROOT_DIR/tmp/retrieval-permission-test"
+DOC_DIR="$ROOT_DIR/scripts/fixtures/retrieval-permission"
 RUN_ID="$(date +%Y%m%d%H%M%S)"
 
 ALICE_USERNAME="alice_perm_$RUN_ID"

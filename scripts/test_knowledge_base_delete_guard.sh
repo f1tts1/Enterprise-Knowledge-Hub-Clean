@@ -10,11 +10,13 @@ BASE_URL="${BASE_URL:-http://localhost:8080}"
 RUN_ID="$(date +%Y%m%d%H%M%S)_$$"
 USERNAME="kb_delete_guard_${RUN_ID}"
 PASSWORD="Password123"
-DEMO_DOC="$(mktemp "${TMPDIR:-/tmp}/ekb-kb-delete-guard.XXXXXX.txt")"
+TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ekb-kb-delete-guard.XXXXXX")"
+DEMO_DOC="$TEMP_DIR/kb-delete-guard.txt"
 DOC_MARKER="KB_DELETE_GUARD_MARKER_${RUN_ID}"
 
 cleanup() {
   rm -f "$DEMO_DOC"
+  rmdir "$TEMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 

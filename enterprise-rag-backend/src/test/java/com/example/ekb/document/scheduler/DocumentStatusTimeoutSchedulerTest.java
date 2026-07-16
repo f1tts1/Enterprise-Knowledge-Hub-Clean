@@ -156,6 +156,52 @@ class DocumentStatusTimeoutSchedulerTest {
         verify(observabilityMetrics, never()).recordIndexingAttempt(any(), any(), anyLong());
     }
 
+    @Test
+    void shouldSkipDocumentTimeoutTransitionWhenTaskCasLosesRace() {
+        when(indexingTaskMapper.selectList(any(LambdaQueryWrapper.class)))
+                .thenReturn(List.of(runningTask()));
+        when(documentMapper.selectById(DOCUMENT_ID)).thenReturn(indexingDocument(TASK_ID));
+        when(indexingTaskMapper.update(isNull(), any(LambdaUpdateWrapper.class))).thenReturn(0);
+
+        scheduler.markTimedOutDocuments();
+
+        verify(indexingTaskMapper, times(1)).update(isNull(), any(LambdaUpdateWrapper.class));
+        verify(documentMapper, never()).update(any(), any());
+        verify(transactionStatus, never()).setRollbackOnly();
+        verify(observabilityMetrics, never()).recordIndexingAttempt(any(), any(), anyLong());
+    }
+
+    @Test
+    void shouldFenceDeletingTimeoutByGenerationAndUpdatedAt() {
+        Document deletingDocument = deletingDocument(4);
+        when(indexingTaskMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of());
+        when(documentMapper.selectList(any(LambdaQueryWrapper.class)))
+                .thenReturn(List.of(deletingDocument));
+        when(documentMapper.update(isNull(), any(LambdaUpdateWrapper.class))).thenReturn(1);
+
+        scheduler.markTimedOutDocuments();
+
+        ArgumentCaptor<LambdaUpdateWrapper<Document>> documentUpdateCaptor = documentUpdateCaptor();
+        verify(documentMapper).update(isNull(), documentUpdateCaptor.capture());
+        LambdaUpdateWrapper<Document> timeoutUpdate = documentUpdateCaptor.getValue();
+        assertThat(timeoutUpdate.getSqlSegment())
+                .contains("is_deleted")
+                .contains("index_status")
+                .contains("delete_generation")
+                .contains("updated_at");
+        assertThat(timeoutUpdate.getSqlSet())
+                .contains("index_status")
+                .contains("error_message");
+        assertThat(timeoutUpdate.getParamNameValuePairs().values())
+                .contains(1, DocumentIndexStatus.DELETING, 4,
+                        DocumentIndexStatus.DELETE_FAILED,
+                        "Document delete timed out; please retry delete");
+
+        verify(indexingTaskMapper, never()).update(any(), any());
+        verify(transactionStatus, never()).setRollbackOnly();
+        verify(observabilityMetrics, never()).recordIndexingAttempt(any(), any(), anyLong());
+    }
+
     private IndexingTask runningTask() {
         IndexingTask task = new IndexingTask();
         task.setId(TASK_ID);
@@ -175,6 +221,18 @@ class DocumentStatusTimeoutSchedulerTest {
         document.setCurrentIndexingTaskId(currentTaskId);
         document.setIndexStatus(DocumentIndexStatus.INDEXING);
         document.setIsDeleted(0);
+        return document;
+    }
+
+    private Document deletingDocument(int generation) {
+        Document document = new Document();
+        document.setId(DOCUMENT_ID);
+        document.setKbId(KB_ID);
+        document.setOwnerUserId(OWNER_USER_ID);
+        document.setDeleteGeneration(generation);
+        document.setIndexStatus(DocumentIndexStatus.DELETING);
+        document.setIsDeleted(1);
+        document.setUpdatedAt(LocalDateTime.now().minusHours(1));
         return document;
     }
 
