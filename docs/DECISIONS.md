@@ -461,3 +461,30 @@
 - 当前同步生成只能记录完整 LLM latency，不记录 TTFT。
 - 当前不把调用日志字段扩展成正式 RAG 评测/实验平台；现有固定集仍只作为轻量回归基线。
 - FastAPI 内部接口尚未实现服务 token/mTLS，仍依赖部署网络边界；requestId 不是身份认证。该问题应作为独立安全边界处理，不能混入 P0-2 伪装完成。
+
+## D25：可靠性证据分层，外部故障采用交互式演练而非生产测试后门
+
+决策：P0-3 将可靠性证据明确分成“自动测试已通过、演练脚本已就绪、外部演练已通过、设计落地”四类。current-task/delete-generation fencing 用确定性 Java 测试回归；RabbitMQ、Qdrant、MinIO 的真实不可用与恢复使用交互式脚本，由操作者控制本地依赖，不在生产 API 或配置中加入故障注入开关。
+
+当前约束：
+
+- Java 测试通过 mapper CAS 返回序列和 `rollbackOnly` 验证迟到 worker、timeout、删除 generation 与失败状态；测试结论只覆盖控制流和条件更新形状，不冒充真实 MySQL 并发事务。
+- `scripts/test_rabbitmq_reliability.sh` 使用 RabbitMQ management API 发布重复/非法消息和读取 DLQ 计数；broker 的停止与恢复由操作者完成。
+- `scripts/test_document_delete_failure_recovery.sh qdrant|minio` 通过公开业务 API和固定只读 SQL验证 `DELETE_FAILED -> DELETED`、`is_deleted=1` 与 generation；不新增可读取已删除内部状态的管理 API。
+- 故障脚本只从环境变量或 MySQL client defaults file 读取本地凭证，不打印凭证；脚本不会执行数据库修复 SQL。
+- 检索/RAG 权限 fixture 保存在 `scripts/fixtures`，不依赖被忽略的 `/tmp` 运行时目录，保证新 clone 可执行。
+- 迟到 Python worker 的外部 Qdrant 副作用不是当前保证。P0-3 只验证旧 worker 不能覆盖 current MySQL 状态，并继续公开该残余风险。
+
+原因：
+
+- 求职证据的价值来自可复现和边界准确，而不是脚本、类或状态名的数量。
+- 为了制造慢 worker 或依赖错误而增加生产故障端点，会扩大攻击面并污染 Java/Python 业务边界。
+- 当前仓库没有统一 Compose 容器名，脚本直接 stop/start 容器会绑定个人环境；人工切换依赖、脚本负责断言，更适合本地求职演示。
+- RabbitMQ/Qdrant/MinIO 外部演练成本较高，不应放入默认单元测试；但必须留下明确命令、前置条件和证据字段。
+
+放弃方案：
+
+- 不增加 chaos 平台、Toxiproxy、通用故障注入框架或 Testcontainers 集群。
+- 不增加 test-only Controller、管理 API、慢响应开关或绕过权限的内部查询接口。
+- 不让脚本猜测并停止固定容器名，也不自动修改业务表伪造状态。
+- 不把 shell 语法通过、Mockito 测试通过或历史 Redis Stream 记录写成 RabbitMQ/Qdrant/MinIO 外部故障已经通过。

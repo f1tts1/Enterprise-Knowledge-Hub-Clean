@@ -62,6 +62,8 @@ class IndexingServiceImplTest {
 
     private AiObservabilityMetrics observabilityMetrics;
 
+    private TransactionStatus transactionStatus;
+
     private IndexingServiceImpl indexingService;
 
     @BeforeAll
@@ -82,12 +84,13 @@ class IndexingServiceImplTest {
         indexingQueueProducer = subclassMock(IndexingQueueProducer.class);
         modelCallLogService = subclassMock(ModelCallLogService.class);
         observabilityMetrics = subclassMock(AiObservabilityMetrics.class);
+        transactionStatus = subclassMock(TransactionStatus.class);
         indexingService = new IndexingServiceImpl(
                 documentMapper,
                 indexingTaskMapper,
                 aiDocumentIndexClient,
                 indexingQueueProducer,
-                immediateTransactionTemplate(),
+                immediateTransactionTemplate(transactionStatus),
                 modelCallLogService,
                 observabilityMetrics
         );
@@ -122,6 +125,23 @@ class IndexingServiceImplTest {
         verifyNoInteractions(aiDocumentIndexClient);
         verify(indexingTaskMapper, never()).update(any(), any());
         verify(documentMapper, never()).update(any(), any());
+    }
+
+    @Test
+    void shouldAcknowledgeCurrentTerminalDuplicateWithoutCallingAiOrUpdatingState() {
+        Document document = pendingDocument();
+        document.setIndexStatus(DocumentIndexStatus.INDEXED);
+        IndexingTask task = pendingTask();
+        task.setStatus(IndexingTaskStatus.SUCCESS);
+        when(documentMapper.selectById(DOCUMENT_ID)).thenReturn(document);
+        when(indexingTaskMapper.selectById(TASK_ID)).thenReturn(task);
+
+        indexingService.processIndexingTask(DOCUMENT_ID, TASK_ID);
+
+        verifyNoInteractions(aiDocumentIndexClient);
+        verify(indexingTaskMapper, never()).update(any(), any());
+        verify(documentMapper, never()).update(any(), any());
+        verifyNoInteractions(modelCallLogService, observabilityMetrics);
     }
 
     @Test
@@ -204,6 +224,66 @@ class IndexingServiceImplTest {
         verifyNoInteractions(modelCallLogService, observabilityMetrics);
     }
 
+    @Test
+    void shouldIgnoreLateAiFailureWhenTimeoutAlreadyFinishedTask() {
+        Document document = pendingDocument();
+        IndexingTask task = pendingTask();
+        when(documentMapper.selectById(DOCUMENT_ID)).thenReturn(document);
+        when(indexingTaskMapper.selectById(TASK_ID)).thenReturn(task);
+        // RUNNING claim succeeds, then timeout has already changed the task out of RUNNING.
+        when(indexingTaskMapper.update(isNull(), any(LambdaUpdateWrapper.class)))
+                .thenReturn(1, 0);
+        when(documentMapper.update(isNull(), any(LambdaUpdateWrapper.class))).thenReturn(1);
+        when(aiDocumentIndexClient.indexDocument(any(AiDocumentIndexRequest.class)))
+                .thenThrow(new IllegalStateException("late AI failure"));
+
+        indexingService.processIndexingTask(DOCUMENT_ID, TASK_ID);
+
+        ArgumentCaptor<LambdaUpdateWrapper<IndexingTask>> taskUpdateCaptor = taskUpdateCaptor();
+        verify(indexingTaskMapper, times(2)).update(isNull(), taskUpdateCaptor.capture());
+        LambdaUpdateWrapper<IndexingTask> lateFailureUpdate = taskUpdateCaptor.getAllValues().get(1);
+        assertThat(lateFailureUpdate.getSqlSegment()).contains("status");
+        assertThat(lateFailureUpdate.getParamNameValuePairs().values())
+                .contains(TASK_ID, IndexingTaskStatus.RUNNING, IndexingTaskStatus.FAILED,
+                        IndexingFailureStage.AI_PIPELINE);
+
+        // 只有进入 INDEXING 的第一次 document 更新；晚到失败不能再覆盖 timeout/retry 后状态。
+        verify(documentMapper, times(1)).update(isNull(), any(LambdaUpdateWrapper.class));
+        verifyNoInteractions(modelCallLogService, observabilityMetrics);
+    }
+
+    @Test
+    void shouldRollbackSuccessTransitionWhenDocumentFenceLosesRace() {
+        Document document = pendingDocument();
+        IndexingTask task = pendingTask();
+        when(documentMapper.selectById(DOCUMENT_ID)).thenReturn(document);
+        when(indexingTaskMapper.selectById(TASK_ID)).thenReturn(task);
+        // RUNNING claim and task SUCCESS CAS succeed, but document current-attempt CAS loses.
+        // The outer failure transition then sees that the old task is no longer writable.
+        when(indexingTaskMapper.update(isNull(), any(LambdaUpdateWrapper.class)))
+                .thenReturn(1, 1, 0);
+        when(documentMapper.update(isNull(), any(LambdaUpdateWrapper.class)))
+                .thenReturn(1, 0);
+        when(aiDocumentIndexClient.indexDocument(any(AiDocumentIndexRequest.class)))
+                .thenReturn(indexedResponse(TASK_ID, DOCUMENT_ID));
+
+        indexingService.processIndexingTask(DOCUMENT_ID, TASK_ID);
+
+        ArgumentCaptor<LambdaUpdateWrapper<Document>> documentUpdateCaptor = documentUpdateCaptor();
+        verify(documentMapper, times(2)).update(isNull(), documentUpdateCaptor.capture());
+        LambdaUpdateWrapper<Document> terminalDocumentUpdate = documentUpdateCaptor.getAllValues().get(1);
+        assertThat(terminalDocumentUpdate.getSqlSegment())
+                .contains("is_deleted")
+                .contains("index_status")
+                .contains("current_indexing_task_id");
+        assertThat(terminalDocumentUpdate.getParamNameValuePairs().values())
+                .contains(TASK_ID, DocumentIndexStatus.INDEXING, DocumentIndexStatus.INDEXED);
+
+        verify(indexingTaskMapper, times(3)).update(isNull(), any(LambdaUpdateWrapper.class));
+        verify(transactionStatus).setRollbackOnly();
+        verifyNoInteractions(modelCallLogService, observabilityMetrics);
+    }
+
     @SuppressWarnings({"rawtypes", "unchecked"})
     private Collection<Object> captureLastTaskUpdateValues() {
         ArgumentCaptor<LambdaUpdateWrapper<IndexingTask>> captor =
@@ -214,6 +294,11 @@ class IndexingServiceImplTest {
 
     @SuppressWarnings({"rawtypes", "unchecked"})
     private ArgumentCaptor<LambdaUpdateWrapper<Document>> documentUpdateCaptor() {
+        return ArgumentCaptor.forClass((Class) LambdaUpdateWrapper.class);
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private ArgumentCaptor<LambdaUpdateWrapper<IndexingTask>> taskUpdateCaptor() {
         return ArgumentCaptor.forClass((Class) LambdaUpdateWrapper.class);
     }
 
@@ -271,11 +356,11 @@ class IndexingServiceImplTest {
         );
     }
 
-    private TransactionTemplate immediateTransactionTemplate() {
+    private TransactionTemplate immediateTransactionTemplate(TransactionStatus status) {
         return new TransactionTemplate() {
             @Override
             public <T> T execute(TransactionCallback<T> action) {
-                return action.doInTransaction(subclassMock(TransactionStatus.class));
+                return action.doInTransaction(status);
             }
         };
     }

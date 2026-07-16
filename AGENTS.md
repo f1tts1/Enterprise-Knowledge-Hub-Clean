@@ -84,6 +84,10 @@ docs/
 
 scripts/
   download_embedding_model.py
+  fixtures/retrieval-permission/  权限回归固定文档，不依赖被忽略的 tmp 目录
+  reliability_test_lib.sh         可靠性脚本共享的 API/状态/只读 SQL 断言
+  test_rabbitmq_reliability.sh    RabbitMQ 停机重投、重复消息、DLQ 演练
+  test_document_delete_failure_recovery.sh  Qdrant/MinIO 删除失败恢复演练
   test_retrieval_permission.sh
   test_document_reupload_delete.sh
   test_rag_ask.sh
@@ -248,6 +252,24 @@ cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub"
 ```
 
 这些脚本只验证当前已实现的同步 RAG：正常问答、空知识库不调用 LLM 的兜底响应，以及 Alice/Bob 之间的 RAG 权限隔离。运行 RAG 生成相关脚本前，需要让 FastAPI 进程能读取 `DEEPSEEK_API_KEY` 或显式 `LLM_*` 配置。
+
+### 当前可靠性故障演练
+
+```bash
+cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub"
+
+# 先在当前本地会话安全设置 RABBITMQ_USERNAME / RABBITMQ_PASSWORD，
+# 不要把真实密码直接写进命令历史。
+MYSQL_DEFAULTS_FILE="$HOME/.my-ekb.cnf" ./scripts/test_rabbitmq_reliability.sh
+
+MYSQL_DEFAULTS_FILE="$HOME/.my-ekb.cnf" \
+./scripts/test_document_delete_failure_recovery.sh qdrant
+
+MYSQL_DEFAULTS_FILE="$HOME/.my-ekb.cnf" \
+./scripts/test_document_delete_failure_recovery.sh minio
+```
+
+这些脚本不会自行停止或启动服务，也不允许为演练增加生产 test-only API。操作者按提示切换本地依赖；脚本负责断言公开 API、固定只读 SQL、模型调用计数和 DLQ。脚本通过只代表“演练脚本已就绪”，只有真实执行并记录日期/环境/关键输出后才能写“外部演练已通过”。Mockito/MyBatis wrapper 测试不能描述成真实 MySQL 并发证据。
 
 ### 当前可演示路径
 

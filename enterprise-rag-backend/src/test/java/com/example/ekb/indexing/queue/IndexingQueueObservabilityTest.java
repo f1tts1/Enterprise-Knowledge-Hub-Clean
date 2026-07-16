@@ -6,6 +6,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.nio.charset.StandardCharsets;
@@ -87,6 +88,19 @@ class IndexingQueueObservabilityTest {
 
         assertThat(RequestIdHolder.getRequestId()).isEqualTo("previous-request");
         verify(channel).basicReject(9L, false);
+    }
+
+    @Test
+    void consumerShouldRejectMalformedJsonWithoutCallingIndexingService() throws Exception {
+        IndexingService indexingService = mock(IndexingService.class);
+        Channel channel = mock(Channel.class);
+        IndexingQueueConsumer consumer = new IndexingQueueConsumer(new ObjectMapper(), indexingService);
+
+        consumer.handle(message(10L, "not-valid-indexing-json"), channel);
+
+        verify(channel).basicReject(10L, false);
+        verifyNoInteractions(indexingService);
+        assertThat(RequestIdHolder.getRequestId()).isNull();
     }
 
     private Message message(long deliveryTag, String json) {

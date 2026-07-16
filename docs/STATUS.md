@@ -1,6 +1,6 @@
 # 项目状态
 
-更新时间：2026-07-15
+更新时间：2026-07-16
 
 本文档只记录当前仓库状态，不记录未来设想为已完成。
 
@@ -191,7 +191,7 @@
 - 已有 `scripts/test_rag_ask.sh`。
 - 已有 `scripts/test_rag_empty_kb.sh`。
 - 已有 `scripts/test_rag_permission.sh`。
-- 已有 `tmp/retrieval-permission-test/*.txt` 测试文档。
+- 权限脚本使用仓库内 `scripts/fixtures/retrieval-permission/*.txt` 固定测试文档，不再依赖被 `.gitignore` 排除的本地 `/tmp` 文件。
 - 检索权限脚本会创建 Alice/Bob 两个用户和知识库，验证不同用户只能检索自己的知识库内容，并验证删除文档后不会再召回该文档 chunk。
 - 重复上传删除脚本会验证同一内容文档删除后可再次上传，并且第二次删除不会与历史 deleted 行的 checksum 唯一约束冲突。
 - RAG 脚本覆盖正常问答、空知识库兜底响应和 Alice/Bob RAG 权限隔离；`test_rag_permission.sh` 已完成端到端验证。
@@ -217,8 +217,19 @@
 - 可靠性矩阵覆盖 RabbitMQ 重复消息、RabbitMQ 发布失败后的 PENDING 手动重投、FastAPI 不可用、人工重试、旧 worker 迟到返回、删除 busy、删除外部资源失败、同内容删除重传、并发同内容上传去重、Qdrant 删除残留防线、并发 Qdrant schema 初始化和权限隔离。
 - 当前已经有脚本覆盖索引失败人工重试、同内容文档重传删除、检索权限隔离、RAG 权限隔离和空知识库短路；部分外部依赖故障注入仍作为人工演练或设计保证记录。
 - 2026-06-29 的 Redis XADD / Redis Stream 记录属于旧队列实现的历史证据，不能作为当前 RabbitMQ 代码的验证结论；对应旧脚本当前也不在仓库中。
-- 2026-07-09 已完成索引队列代码层替换：RabbitMQ exchange/queue/DLQ、手动 ack listener、PENDING 重投器已落地；RabbitMQ 故障脚本仍需在本地依赖启动后重新验证。
+- 2026-07-09 已完成索引队列代码层替换：RabbitMQ exchange/queue/DLQ、手动 ack listener、PENDING 重投器已落地；当前 RabbitMQ 外部停机/恢复脚本已就绪，但仍需在本地依赖启动后实际执行并留证。
 - 2026-07-15 已落地 P0-1 状态机加固：不可变索引 attempt、current task fencing、消息关联校验、超时原子收口、PENDING 发布节流、删除 generation fencing，以及知识库删除/文档上传写路径串行化。
+
+### P0-3 可靠性故障演练与证据固化
+
+- 新增 9 个确定性 Java 测试：current SUCCESS 重复消息不调用 AI、非法 RabbitMQ JSON reject、晚到 worker 成功/异常的 stale CAS、terminal document CAS 丢竞争回滚、timeout task CAS 丢竞争、删除 timeout generation、Qdrant/MinIO 删除异常，以及 `DELETE_FAILED` 重试 generation 单调递增。
+- 2026-07-16 已实际执行 Java 全量测试，55 个通过，0 failures、0 errors、0 skipped；其中 Mockito/MyBatis wrapper 测试只证明控制流和条件更新形状，不冒充真实 MySQL 并发测试。
+- 新增 `scripts/test_rabbitmq_reliability.sh`：覆盖 broker 停机时 PENDING、scheduler 自动重投同一 attempt、PENDING 删除 409、终态重复消息不新增 Java→Python `document_index` HTTP 尝试或模型日志，以及非法 JSON 进入 DLQ。
+- 新增 `scripts/test_document_delete_failure_recovery.sh qdrant|minio`：覆盖删除外部依赖失败后业务不可见、只读 SQL 状态证据、依赖恢复后的 generation 重试；Qdrant 模式用控制文档避免空库短路，以验证 MySQL 二次过滤不返回残留目标 vector。
+- 两个故障脚本不自行停止/启动服务，不增加生产故障注入接口；需要操作者在本地切换依赖。当前只完成脚本语法检查，尚未宣称真实 RabbitMQ/Qdrant/MinIO 停机演练通过。
+- 修复检索/RAG 权限脚本的不可移植 fixture：此前依赖未跟踪的 `tmp/retrieval-permission-test`，新 clone 会缺文件；现在固定素材已纳入 `scripts/fixtures/retrieval-permission`。
+- 修复可靠性/RAG shell 在 macOS BSD `mktemp` 下不会替换文件名中间 `XXXXXX` 的问题：统一先创建唯一临时目录，再在目录内生成保留 `.txt` 扩展名的上传文件。
+- `docs/RELIABILITY_MATRIX.md` 已将证据分为“自动测试已通过 / 演练脚本已就绪 / 外部演练已通过 / 设计落地”，避免把代码存在写成外部故障结论。
 
 ## 正在进行
 
@@ -226,7 +237,7 @@
 
 P0-1 后端可靠性已合并到 main；代码完成不等于外部故障演练已经完成，RabbitMQ、慢 worker、Qdrant/MinIO 故障仍按实际证据单独记录。
 
-P0-2 基础可观测性已在功能分支完成代码、契约、单元测试和审查，等待本地 commit / PR。当前文档不虚构 Prometheus 抓取结果、生产流量数据或故障演练数据；这些只能在本地依赖实际启动后另行留证。
+P0-2 基础可观测性已合并到 main。当前 P0-3 功能分支已完成可靠性自动测试、可复现故障脚本和证据口径开发，等待本地外部演练与 commit / PR；文档不虚构 Prometheus 抓取结果、生产流量数据或外部故障演练数据，这些只能在本地依赖实际启动后另行留证。
 
 ## 尚未完成
 
@@ -236,7 +247,8 @@ P0-2 基础可观测性已在功能分支完成代码、契约、单元测试和
 - query rewrite、hybrid search、rerank、context compression。
 - 基于评测结果的 chunk size、topK、相似度阈值对照实验。
 - 人工或 LLM judge 形式的答案正确性、忠实度细粒度评分。
-- RabbitMQ 发布失败、旧 worker 迟到触碰 Qdrant、Qdrant/MinIO 删除失败的自动化外部故障注入脚本。
+- RabbitMQ、Qdrant、MinIO 真实停机/恢复演练结果；交互式脚本已经就绪，但尚未在本轮启动完整依赖执行。
+- 旧 worker 的 Qdrant execution fencing；当前只保护 MySQL current 状态，不保证已经发出的 Python 调用没有外部副作用。
 - Agent 工作流。
 - Docker Compose 一键部署。
 - 完整 RBAC。
@@ -298,8 +310,8 @@ RAG 生成接口需要可用 LLM 配置。可以显式设置 `LLM_PROVIDER=opena
 
 ## 下一步最优先任务
 
-P0-2 代码完成后的下一步：
+P0-3 代码与脚本完成后的下一步：
 
-1. 本地提交功能分支、推送并通过 PR 审查后手动合并。
-2. 在本地依赖实际启动后，用一个自定义 `X-Request-Id` 和一个索引 task 留下 Java/Python/LLM 关联日志、`model_call_log` 和 Prometheus 抓取证据；不虚构生产数据。
-3. 单独规划 Java→FastAPI 服务鉴权边界；在可靠性和可观测证据整理完成前，不启动 SSE、Agent、hybrid/rerank 或多轮会话等新功能。
+1. 在本地依赖实际启动后分别执行 RabbitMQ、Qdrant 和 MinIO 故障脚本，把日期、task/document ID、状态迁移和关键计数写入可靠性矩阵；不把“脚本存在”写成“演练通过”。
+2. 用一个自定义 `X-Request-Id` 和一个索引 task 留下 Java/Python/LLM 关联日志、`model_call_log` 与 Prometheus 抓取证据。
+3. P0-3 经 commit / PR 审查并手动合并后，停止继续堆业务功能，转向演示材料、架构决策复盘和面试讲解；Java→FastAPI 服务鉴权另行规划，不混入本阶段。

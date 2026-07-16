@@ -1,0 +1,5 @@
+RabbitMQ 用于文档上传后的异步索引任务队列。
+
+在当前项目中，Spring Boot 先把 document 和 indexing_task 写入 MySQL，事务提交后再向 RabbitMQ 发布只包含 documentId 和 indexingTaskId 的消息。消费者重新查询 MySQL，校验 document、knowledge base、owner 和 current indexing task 的关联后，才调用 FastAPI 执行索引。
+
+关键词：RabbitMQ、异步索引、MySQL 事实源、重复消息幂等、失败恢复。
