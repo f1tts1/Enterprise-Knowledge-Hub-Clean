@@ -3,6 +3,11 @@ from fastapi import FastAPI
 from app.api.v1.documents import router as documents_router
 from app.api.v1.rag import router as rag_router
 from app.api.v1.retrieval import router as retrieval_router
+from app.observability.logging_config import configure_application_logging
+from app.observability.request_context import RequestContextMiddleware
+
+
+configure_application_logging()
 
 # FastAPI 没有 Java 那种固定的启动类。这里的 app 对象就是应用入口。
 # 启动命令 `uvicorn app.main:app` 的含义是：
@@ -10,6 +15,10 @@ from app.api.v1.retrieval import router as retrieval_router
 #   2. 找到下面这个名为 app 的 FastAPI 实例
 #   3. 由 uvicorn 负责启动 HTTP 服务并把请求分发到已挂载的 router
 app = FastAPI(title="RAG AI Service", version="0.0.1")
+
+# Java 入口请求、Python 业务日志和下游 LLM 调用共用同一个 requestId。
+# 中间件同时处理非法/缺失 header，并确保响应也带回最终采用的 requestId。
+app.add_middleware(RequestContextMiddleware)
 
 # Java 调用 http://localhost:8000/api/v1/documents/index 时，
 # 请求会先进入这个 FastAPI app，再根据 include_router 挂载关系，

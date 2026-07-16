@@ -1,5 +1,6 @@
 package com.example.ekb.document.scheduler;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
 
@@ -8,10 +9,12 @@ import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.example.ekb.common.constants.DocumentIndexStatus;
 import com.example.ekb.common.constants.IndexingFailureStage;
 import com.example.ekb.common.constants.IndexingTaskStatus;
+import com.example.ekb.common.utils.RequestIdHolder;
 import com.example.ekb.document.entity.Document;
 import com.example.ekb.document.mapper.DocumentMapper;
 import com.example.ekb.indexing.entity.IndexingTask;
 import com.example.ekb.indexing.mapper.IndexingTaskMapper;
+import com.example.ekb.observability.metrics.AiObservabilityMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -33,15 +36,18 @@ public class DocumentStatusTimeoutScheduler {
     private final DocumentMapper documentMapper;
     private final IndexingTaskMapper indexingTaskMapper;
     private final TransactionTemplate transactionTemplate;
+    private final AiObservabilityMetrics observabilityMetrics;
 
     public DocumentStatusTimeoutScheduler(
             DocumentMapper documentMapper,
             IndexingTaskMapper indexingTaskMapper,
-            TransactionTemplate transactionTemplate
+            TransactionTemplate transactionTemplate,
+            AiObservabilityMetrics observabilityMetrics
     ) {
         this.documentMapper = documentMapper;
         this.indexingTaskMapper = indexingTaskMapper;
         this.transactionTemplate = transactionTemplate;
+        this.observabilityMetrics = observabilityMetrics;
     }
 
     @Scheduled(fixedDelayString = "${app.document.status-timeout-check-interval-ms:60000}")
@@ -62,7 +68,14 @@ public class DocumentStatusTimeoutScheduler {
                 .orderByAsc(IndexingTask::getId)
                 .last("LIMIT " + TIMEOUT_BATCH_SIZE));
         for (IndexingTask task : tasks) {
-            markIndexingTimedOut(task, threshold);
+            String previousRequestId = RequestIdHolder.setRequestId(
+                    RequestIdHolder.forIndexingTask(task.getId())
+            );
+            try {
+                markIndexingTimedOut(task, threshold);
+            } finally {
+                RequestIdHolder.restoreRequestId(previousRequestId);
+            }
         }
     }
 
@@ -122,6 +135,24 @@ public class DocumentStatusTimeoutScheduler {
         if (Boolean.TRUE.equals(updated)) {
             log.warn("Marked indexing document timed out, documentId={}, taskId={}",
                     document.getId(), task.getId());
+            recordTimeoutMetric(task);
+        }
+    }
+
+    private void recordTimeoutMetric(IndexingTask task) {
+        try {
+            LocalDateTime startedAt = task.getStartedAt();
+            long durationNanos = startedAt == null
+                    ? 0L
+                    : Math.max(0L, Duration.between(startedAt, LocalDateTime.now()).toNanos());
+            observabilityMetrics.recordIndexingAttempt(
+                    "failure",
+                    IndexingFailureStage.TIMEOUT,
+                    durationNanos
+            );
+        } catch (RuntimeException ex) {
+            log.warn("Failed to record indexing timeout metric, taskId={}, errorType={}",
+                    task.getId(), ex.getClass().getSimpleName());
         }
     }
 

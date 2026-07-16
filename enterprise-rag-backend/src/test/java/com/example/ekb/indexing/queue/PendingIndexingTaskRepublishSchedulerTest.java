@@ -1,7 +1,9 @@
 package com.example.ekb.indexing.queue;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -10,6 +12,7 @@ import static org.mockito.Mockito.when;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import com.baomidou.mybatisplus.core.MybatisConfiguration;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
@@ -17,15 +20,18 @@ import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
 import com.example.ekb.common.constants.DocumentIndexStatus;
 import com.example.ekb.common.constants.IndexingTaskStatus;
+import com.example.ekb.common.utils.RequestIdHolder;
 import com.example.ekb.document.entity.Document;
 import com.example.ekb.document.mapper.DocumentMapper;
 import com.example.ekb.indexing.entity.IndexingTask;
 import com.example.ekb.indexing.mapper.IndexingTaskMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.MockMakers;
 import org.apache.ibatis.builder.MapperBuilderAssistant;
+import org.slf4j.MDC;
 
 class PendingIndexingTaskRepublishSchedulerTest {
 
@@ -68,6 +74,11 @@ class PendingIndexingTaskRepublishSchedulerTest {
         );
     }
 
+    @AfterEach
+    void clearMdc() {
+        MDC.clear();
+    }
+
     @Test
     void shouldNotPublishWhenAnotherSchedulerAlreadyClaimedTask() {
         IndexingTask task = pendingTask();
@@ -87,12 +98,20 @@ class PendingIndexingTaskRepublishSchedulerTest {
         when(indexingTaskMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of(task));
         when(documentMapper.selectById(DOCUMENT_ID)).thenReturn(waitingDocument());
         when(indexingTaskMapper.update(isNull(), any(LambdaUpdateWrapper.class))).thenReturn(1);
+        AtomicReference<String> requestIdDuringPublish = new AtomicReference<>();
+        doAnswer(invocation -> {
+            requestIdDuringPublish.set(RequestIdHolder.getRequestId());
+            return null;
+        }).when(indexingQueueProducer).publish(any(IndexingQueueMessage.class));
+        RequestIdHolder.setRequestId("scheduler-request");
 
         scheduler.republishStalePendingTasks();
 
         verify(indexingTaskMapper).update(isNull(), any(LambdaUpdateWrapper.class));
         verify(indexingQueueProducer, times(1))
                 .publish(new IndexingQueueMessage(DOCUMENT_ID, TASK_ID));
+        assertThat(requestIdDuringPublish.get()).isEqualTo("index-task-201");
+        assertThat(RequestIdHolder.getRequestId()).isEqualTo("scheduler-request");
     }
 
     private IndexingTask pendingTask() {

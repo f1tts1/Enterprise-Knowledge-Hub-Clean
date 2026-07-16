@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import logging
+from time import perf_counter
+
 import httpx
 
 from app.config.settings import Settings, get_settings
+from app.observability.request_context import (
+    REQUEST_ID_HEADER,
+    elapsed_ms,
+    get_request_id,
+    request_id_for_log,
+)
 from app.schemas.rag import RagContextChunk, RagGenerateRequest, RagGenerateResponse
 
 
@@ -11,6 +20,8 @@ SYSTEM_PROMPT = (
     "不要编造片段中不存在的信息。回答要简洁、具体。"
     "引用依据时必须使用 [片段 1]、[片段 2] 这样的标记。"
 )
+
+logger = logging.getLogger(__name__)
 
 
 class LlmProviderError(RuntimeError):
@@ -28,10 +39,17 @@ class RagGenerationService:
         self._settings = settings or get_settings()
 
     async def generate(self, request: RagGenerateRequest) -> RagGenerateResponse:
-        self._ensure_provider_configured()
-        model = self._settings.resolved_llm_model()
-        base_url = self._settings.resolved_llm_base_url()
-        api_key = self._settings.resolved_llm_api_key()
+        total_started_at = perf_counter()
+        try:
+            self._ensure_provider_configured()
+            model = self._settings.resolved_llm_model()
+            base_url = self._settings.resolved_llm_base_url()
+            api_key = self._settings.resolved_llm_api_key()
+            chat_completions_url = _chat_completions_url(base_url)
+        except Exception as exc:
+            _log_failure("configuration", total_started_at, exc)
+            raise
+
         payload = {
             "model": model,
             "messages": [
@@ -42,26 +60,57 @@ class RagGenerationService:
             "max_tokens": self._settings.llm_max_tokens,
         }
 
+        llm_started_at = perf_counter()
         try:
             async with httpx.AsyncClient(timeout=self._settings.llm_timeout_seconds) as client:
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                }
+                request_id = get_request_id()
+                if request_id:
+                    headers[REQUEST_ID_HEADER] = request_id
                 response = await client.post(
-                    _chat_completions_url(base_url),
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
+                    chat_completions_url,
+                    headers=headers,
                     json=payload,
                 )
                 response.raise_for_status()
-                data = response.json()
         except httpx.HTTPError as exc:
+            _log_failure("llm_http", total_started_at, exc)
             raise LlmProviderError(f"LLM 调用失败: {exc}") from exc
+        except Exception as exc:
+            _log_failure("llm_http", total_started_at, exc)
+            raise
 
-        answer = _extract_answer(data)
+        try:
+            data = response.json()
+            answer = _extract_answer(data)
+            prompt_tokens, completion_tokens, total_tokens = _extract_usage(data)
+        except Exception as exc:
+            _log_failure("response_parse", total_started_at, exc)
+            raise
+        llm_latency_ms = elapsed_ms(llm_started_at)
+        logger.info(
+            "request_id=%s operation=rag_generate provider=%s model=%s context_count=%s "
+            "llm_latency_ms=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+            request_id_for_log(),
+            self._settings.resolved_llm_provider(),
+            model,
+            len(request.contexts),
+            llm_latency_ms,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        )
         return RagGenerateResponse(
             answer=answer,
             llm_provider=self._settings.resolved_llm_provider(),
             llm_model=model or "",
+            llm_latency_ms=llm_latency_ms,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
         )
 
     def _ensure_provider_configured(self) -> None:
@@ -115,6 +164,37 @@ def _extract_answer(data: dict) -> str:
     if not isinstance(answer, str) or not answer.strip():
         raise LlmProviderError("LLM 响应内容为空")
     return answer.strip()
+
+
+def _extract_usage(data: dict) -> tuple[int | None, int | None, int | None]:
+    """提取 OpenAI-compatible usage；提供方未返回时保留为未知而不是伪造 0。"""
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None, None, None
+
+    prompt_tokens = _non_negative_int(usage.get("prompt_tokens"))
+    completion_tokens = _non_negative_int(usage.get("completion_tokens"))
+    total_tokens = _non_negative_int(usage.get("total_tokens"))
+    if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+        total_tokens = prompt_tokens + completion_tokens
+    return prompt_tokens, completion_tokens, total_tokens
+
+
+def _non_negative_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _log_failure(failure_stage: str, total_started_at: float, exc: Exception) -> None:
+    """不写入 prompt/question/context/answer/API key 和异常 message。"""
+    logger.error(
+        "request_id=%s failure_stage=%s total_latency_ms=%s error_type=%s",
+        request_id_for_log(),
+        failure_stage,
+        elapsed_ms(total_started_at),
+        type(exc).__name__,
+    )
 
 
 rag_generation_service = RagGenerationService()

@@ -44,7 +44,9 @@ http://localhost:8000
 }
 ```
 
-客户端可传入 `X-Request-Id`。如果不传，Java 后端生成 requestId，并在响应 body 和 header 中返回。
+客户端可传入 `X-Request-Id`。Java 只接受 1～64 字符且匹配 `[A-Za-z0-9._:-]+` 的值；缺失、空白、过长或含控制/其它不安全字符时生成 UUID。最终值会写入 Java 响应 body/header、MDC，并通过 WebClient 传给 FastAPI。FastAPI 使用相同规则兜底校验并在响应 header 中返回最终值。
+
+同步检索/RAG 请求沿用入口 requestId。异步索引不沿用上传 HTTP requestId：生产者和消费者都根据已持久化 taskId 生成稳定的 `index-task-{indexingTaskId}`，并把它用于 AMQP correlationId、Java MDC 和 Java→Python `X-Request-Id`。消息 body 仍只包含 `documentId` 和 `indexingTaskId`。
 
 ### 鉴权
 
@@ -65,7 +67,16 @@ Java 解析 JWT 后会加载当前用户快照；当前实现优先读取 Redis 
 
 知识库 owner 权限校验仍由 Java 完成；当前实现会优先读取 Redis 知识库访问缓存，缓存未命中或 Redis 不可用时回源 MySQL。该缓存不改变 API 响应语义，访问不存在、已删除或不属于当前用户的知识库仍返回 not found 风格错误。
 
-当前没有 health 接口。
+`GET /actuator/prometheus` 由 Actuator 提供，但没有匿名放行，仍需要有效 access token。当前没有 health 接口。
+
+### Prometheus 指标
+
+```http
+GET /actuator/prometheus
+Authorization: Bearer <accessToken>
+```
+
+该端点返回 Prometheus text exposition，不使用 `ApiResponse<T>` 包装。指标标签只包含有限枚举，不包含 requestId、userId、kbId、documentId 或 taskId。当前没有 Grafana 看板、告警或长期指标存储。
 
 ## Java API
 
@@ -605,7 +616,9 @@ Content-Type: application/json
 
 ## Python API
 
-Python API 当前是 Java 内部调用接口，不面向客户端直接暴露鉴权。
+Python API 当前是 Java 内部调用接口，不面向客户端直接暴露鉴权。Java 调用会携带 `X-Request-Id`，Python 会在响应头返回最终采用的值；直接调用 Python 且不带合法 header 时由 Python 生成 UUID。
+
+当前内部接口尚未实现服务 token/mTLS，依赖部署网络边界限制访问。这是已知的后续安全边界，不应把 FastAPI 直接暴露到不受信任网络，也不能把 requestId 当作身份认证。
 
 ### 文档索引
 
@@ -650,9 +663,17 @@ Content-Type: application/json
   "vector_store": "qdrant",
   "vector_collection": "rag_chunks_v1",
   "text_preview": "前 300 字以内文本预览",
-  "chunk_preview": "第一个 chunk 文本"
+  "chunk_preview": "第一个 chunk 文本",
+  "download_latency_ms": 12,
+  "parse_latency_ms": 8,
+  "split_latency_ms": 3,
+  "embedding_latency_ms": 45,
+  "vector_store_latency_ms": 20,
+  "total_latency_ms": 88
 }
 ```
+
+阶段耗时均为 Python 进程内基于单调时钟计算的非负整数毫秒；`total_latency_ms` 覆盖完整索引 pipeline，不要求严格等于各阶段整数毫秒之和。它们是排障字段，不参与 Java 的索引成功判断。
 
 Python schema 允许的状态：
 
@@ -738,8 +759,13 @@ Content-Type: application/json
 {
   "query": "RabbitMQ 异步索引",
   "top_k": 5,
+  "embedding_provider": "local",
+  "embedding_model": "BAAI/bge-small-zh-v1.5",
   "vector_store": "qdrant",
   "vector_collection": "rag_chunks_v1",
+  "embedding_latency_ms": 16,
+  "vector_store_latency_ms": 7,
+  "total_latency_ms": 23,
   "records": [
     {
       "point_id": "uuid",
@@ -756,6 +782,8 @@ Content-Type: application/json
   ]
 }
 ```
+
+上述三个耗时字段用于区分 query embedding 和 Qdrant 检索开销，不参与检索权限判断。Java 仍会在返回客户端前按 MySQL 活动且 `INDEXED` 文档二次过滤命中。
 
 错误：
 
@@ -795,7 +823,11 @@ Content-Type: application/json
 {
   "answer": "RabbitMQ 用于把文档上传和索引处理解耦...",
   "llm_provider": "openai-compatible",
-  "llm_model": "your-chat-model"
+  "llm_model": "your-chat-model",
+  "llm_latency_ms": 842,
+  "prompt_tokens": 321,
+  "completion_tokens": 88,
+  "total_tokens": 409
 }
 ```
 
@@ -806,6 +838,9 @@ Content-Type: application/json
 - 当前只支持 OpenAI-compatible Chat Completions。
 - 可显式配置 `LLM_PROVIDER=openai-compatible`、`LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`。
 - 如果本机存在 `DEEPSEEK_API_KEY`，Python 会自动使用 DeepSeek 默认配置：`LLM_BASE_URL=https://api.deepseek.com/v1`、`LLM_MODEL=deepseek-chat`。
+- Python 调用 OpenAI-compatible provider 时继续传递本次 `X-Request-Id`。
+- `llm_latency_ms` 是当前非流式 Chat Completions 的完整 HTTP 调用耗时，不是 TTFT。
+- token usage 由 provider 响应提供；provider 未返回时三个字段可为 `null`。Java 的 `model_call_log` 只持久化 prompt/completion 两列，缺失值按当前 schema 记录为 0，不能据此断言 provider 实际消耗为 0。
 
 错误：
 
@@ -813,6 +848,19 @@ Content-Type: application/json
 - 503：LLM provider 未配置或 LLM 调用失败。
 
 ## MySQL 约束
+
+### model_call_log 可观测记录
+
+`model_call_log` 现已由 Java 可观测旁路使用，字段包括 `request_id`、`user_id`、`provider`、`model`、`call_type`、prompt/completion tokens、`latency_ms`、`success`、脱敏后的 `error_message` 和创建时间。
+
+当前写入边界：
+
+- 索引在 MySQL `INDEXED/SUCCESS` 终态事务提交后记录一次成功 `EMBEDDING`。
+- 实际调用 Python 检索并成功返回时记录一次成功 `EMBEDDING`；无已索引文档短路不创建记录。
+- 实际发起 LLM 生成时记录 `CHAT` 成功或失败；无上下文短路不创建伪造的 `CHAT` 记录。
+- 目前不会把下载、解析或 Qdrant 失败误写成 embedding 模型失败，因此 `EMBEDDING` 行不能单独计算完整索引失败率。
+- 写入是 best-effort。插入失败只记录脱敏告警，不改变索引、检索或 RAG 结果。
+- 不保存完整 question、prompt、chunk、answer、Authorization 或 API Key。
 
 ### document checksum 去重
 
@@ -870,11 +918,13 @@ deadLetterRoutingKey: indexing.task.dead
 说明：
 
 - RabbitMQ 消息只保存 ID。
+- AMQP `correlationId` 使用 `index-task-{indexingTaskId}`。它是可观测元数据，不参与 task/document 状态判断；同一 PENDING attempt 重投时保持不变。
 - Java 消费者重新查 MySQL 获取 bucket、objectKey、文件名、checksum。
 - 消费者校验 task 的 `documentId + kbId + ownerUserId` 与 document 一致；静态关联错误作为非法消息进入 DLQ。
 - 合法但不再等于 `document.current_indexing_task_id` 的旧 attempt 消息会 ack 并跳过；只有当前 `PENDING` attempt 可以进入 `RUNNING`。
 - Java 消费者正常处理后手动 ack；消费者自身异常或非法消息进入 DLQ。
 - Python 不访问 MySQL。
+- 消费者不信任消息属性中的任意 correlationId，而是从成功解析的 `indexingTaskId` 重新生成关联 ID。
 
 ### Java 调 Python 文档索引 DTO 映射
 
@@ -920,6 +970,25 @@ deadLetterRoutingKey: indexing.task.dead
 | contexts[].chunkIndex | contexts[].chunk_index | contexts[].chunk_index |
 | contexts[].score | contexts[].score | contexts[].score |
 | contexts[].text | contexts[].text | contexts[].text |
+
+### Python 可观测响应字段映射
+
+Python 使用 snake_case，Java DTO 使用 camelCase：
+
+| Python JSON | Java DTO | 含义 |
+|---|---|---|
+| download_latency_ms | downloadLatencyMs | MinIO 下载耗时 |
+| parse_latency_ms | parseLatencyMs | 文档解析耗时 |
+| split_latency_ms | splitLatencyMs | chunk 切分耗时 |
+| embedding_latency_ms | embeddingLatencyMs | 文档或 query embedding 耗时 |
+| vector_store_latency_ms | vectorStoreLatencyMs | Qdrant 写入或检索耗时 |
+| total_latency_ms | totalLatencyMs | Python pipeline 总耗时 |
+| llm_latency_ms | llmLatencyMs | 非流式 LLM 完整调用耗时 |
+| prompt_tokens | promptTokens | provider 可选 prompt usage |
+| completion_tokens | completionTokens | provider 可选 completion usage |
+| total_tokens | totalTokens | provider 可选总 usage |
+
+这些字段只用于日志、指标和 `model_call_log`，不替代业务状态、权限过滤或引用溯源字段。完整 LLM 耗时不能描述为首 token 延迟。
 
 ### Java 处理 Python 索引响应
 

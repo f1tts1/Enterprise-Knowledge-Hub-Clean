@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, HTTPException
 from minio.error import S3Error
 
@@ -5,6 +7,7 @@ from app.clients.qdrant_client import QdrantChunkVectorStore, VectorStoreError
 from app.config.settings import get_settings
 from app.document_loader.factory import UnsupportedDocumentTypeError
 from app.indexing.service import indexing_service
+from app.observability.request_context import request_id_for_log
 from app.schemas.document import (
     DeleteDocumentVectorsRequest,
     DeleteDocumentVectorsResponse,
@@ -14,6 +17,7 @@ from app.schemas.document import (
 
 router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
 _vector_store: QdrantChunkVectorStore | None = None
+logger = logging.getLogger(__name__)
 
 
 @router.post("/index", response_model=IndexDocumentResponse)
@@ -54,6 +58,16 @@ async def delete_document_vectors(request: DeleteDocumentVectorsRequest) -> Dele
             owner_user_id=request.owner_user_id,
             kb_id=request.kb_id,
             document_id=request.document_id,
+        )
+        logger.info(
+            "request_id=%s operation=delete_document_vectors owner_user_id=%s kb_id=%s "
+            "document_id=%s collection=%s collection_existed=%s",
+            request_id_for_log(),
+            request.owner_user_id,
+            request.kb_id,
+            request.document_id,
+            vector_store.collection_name,
+            collection_existed,
         )
         return DeleteDocumentVectorsResponse(
             document_id=request.document_id,

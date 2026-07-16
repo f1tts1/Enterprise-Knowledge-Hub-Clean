@@ -2,9 +2,12 @@ package com.example.ekb.document.scheduler;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -12,6 +15,7 @@ import static org.mockito.Mockito.withSettings;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import com.baomidou.mybatisplus.core.MybatisConfiguration;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
@@ -20,16 +24,20 @@ import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
 import com.example.ekb.common.constants.DocumentIndexStatus;
 import com.example.ekb.common.constants.IndexingFailureStage;
 import com.example.ekb.common.constants.IndexingTaskStatus;
+import com.example.ekb.common.utils.RequestIdHolder;
 import com.example.ekb.document.entity.Document;
 import com.example.ekb.document.mapper.DocumentMapper;
 import com.example.ekb.indexing.entity.IndexingTask;
 import com.example.ekb.indexing.mapper.IndexingTaskMapper;
+import com.example.ekb.observability.metrics.AiObservabilityMetrics;
 import org.apache.ibatis.builder.MapperBuilderAssistant;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.MockMakers;
+import org.slf4j.MDC;
 import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.TransactionCallback;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -44,6 +52,7 @@ class DocumentStatusTimeoutSchedulerTest {
     private DocumentMapper documentMapper;
     private IndexingTaskMapper indexingTaskMapper;
     private TransactionStatus transactionStatus;
+    private AiObservabilityMetrics observabilityMetrics;
     private DocumentStatusTimeoutScheduler scheduler;
 
     @BeforeAll
@@ -61,12 +70,19 @@ class DocumentStatusTimeoutSchedulerTest {
         documentMapper = subclassMock(DocumentMapper.class);
         indexingTaskMapper = subclassMock(IndexingTaskMapper.class);
         transactionStatus = subclassMock(TransactionStatus.class);
+        observabilityMetrics = subclassMock(AiObservabilityMetrics.class);
         scheduler = new DocumentStatusTimeoutScheduler(
                 documentMapper,
                 indexingTaskMapper,
-                immediateTransactionTemplate(transactionStatus)
+                immediateTransactionTemplate(transactionStatus),
+                observabilityMetrics
         );
         when(documentMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of());
+    }
+
+    @AfterEach
+    void clearMdc() {
+        MDC.clear();
     }
 
     @Test
@@ -76,6 +92,12 @@ class DocumentStatusTimeoutSchedulerTest {
         when(documentMapper.selectById(DOCUMENT_ID)).thenReturn(indexingDocument(TASK_ID));
         when(indexingTaskMapper.update(isNull(), any(LambdaUpdateWrapper.class))).thenReturn(1);
         when(documentMapper.update(isNull(), any(LambdaUpdateWrapper.class))).thenReturn(1);
+        AtomicReference<String> requestIdDuringMetric = new AtomicReference<>();
+        doAnswer(invocation -> {
+            requestIdDuringMetric.set(RequestIdHolder.getRequestId());
+            return null;
+        }).when(observabilityMetrics).recordIndexingAttempt(any(), any(), anyLong());
+        RequestIdHolder.setRequestId("scheduler-request");
 
         scheduler.markTimedOutDocuments();
 
@@ -95,6 +117,13 @@ class DocumentStatusTimeoutSchedulerTest {
         assertThat(documentUpdate.getSqlSegment()).contains("current_indexing_task_id");
         assertThat(documentUpdate.getParamNameValuePairs().values()).contains(TASK_ID);
         verify(transactionStatus, never()).setRollbackOnly();
+        verify(observabilityMetrics).recordIndexingAttempt(
+                eq("failure"),
+                eq(IndexingFailureStage.TIMEOUT),
+                anyLong()
+        );
+        assertThat(requestIdDuringMetric.get()).isEqualTo("index-task-201");
+        assertThat(RequestIdHolder.getRequestId()).isEqualTo("scheduler-request");
     }
 
     @Test
@@ -108,6 +137,7 @@ class DocumentStatusTimeoutSchedulerTest {
         verify(indexingTaskMapper, never()).update(any(), any());
         verify(documentMapper, never()).update(any(), any());
         verify(transactionStatus, never()).setRollbackOnly();
+        verify(observabilityMetrics, never()).recordIndexingAttempt(any(), any(), anyLong());
     }
 
     @Test
@@ -123,6 +153,7 @@ class DocumentStatusTimeoutSchedulerTest {
         verify(indexingTaskMapper, times(1)).update(isNull(), any(LambdaUpdateWrapper.class));
         verify(documentMapper, times(1)).update(isNull(), any(LambdaUpdateWrapper.class));
         verify(transactionStatus).setRollbackOnly();
+        verify(observabilityMetrics, never()).recordIndexingAttempt(any(), any(), anyLong());
     }
 
     private IndexingTask runningTask() {

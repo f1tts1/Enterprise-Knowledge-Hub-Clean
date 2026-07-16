@@ -10,6 +10,7 @@ import com.example.ekb.ai.dto.AiDocumentIndexResponse;
 import com.example.ekb.common.constants.DocumentIndexStatus;
 import com.example.ekb.common.constants.IndexingFailureStage;
 import com.example.ekb.common.constants.IndexingTaskStatus;
+import com.example.ekb.common.utils.RequestIdHolder;
 import com.example.ekb.document.entity.Document;
 import com.example.ekb.document.mapper.DocumentMapper;
 import com.example.ekb.indexing.entity.IndexingTask;
@@ -17,6 +18,10 @@ import com.example.ekb.indexing.mapper.IndexingTaskMapper;
 import com.example.ekb.indexing.queue.IndexingQueueMessage;
 import com.example.ekb.indexing.queue.IndexingQueueProducer;
 import com.example.ekb.indexing.service.IndexingService;
+import com.example.ekb.observability.metrics.AiObservabilityMetrics;
+import com.example.ekb.observability.model.ModelCallLogRecord;
+import com.example.ekb.observability.model.ModelCallType;
+import com.example.ekb.observability.service.ModelCallLogService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -41,19 +46,25 @@ public class IndexingServiceImpl implements IndexingService {
     private final AiDocumentIndexClient aiDocumentIndexClient;
     private final IndexingQueueProducer indexingQueueProducer;
     private final TransactionTemplate transactionTemplate;
+    private final ModelCallLogService modelCallLogService;
+    private final AiObservabilityMetrics observabilityMetrics;
 
     public IndexingServiceImpl(
             DocumentMapper documentMapper,
             IndexingTaskMapper indexingTaskMapper,
             AiDocumentIndexClient aiDocumentIndexClient,
             IndexingQueueProducer indexingQueueProducer,
-            TransactionTemplate transactionTemplate
+            TransactionTemplate transactionTemplate,
+            ModelCallLogService modelCallLogService,
+            AiObservabilityMetrics observabilityMetrics
     ) {
         this.documentMapper = documentMapper;
         this.indexingTaskMapper = indexingTaskMapper;
         this.aiDocumentIndexClient = aiDocumentIndexClient;
         this.indexingQueueProducer = indexingQueueProducer;
         this.transactionTemplate = transactionTemplate;
+        this.modelCallLogService = modelCallLogService;
+        this.observabilityMetrics = observabilityMetrics;
     }
 
     @Override
@@ -117,12 +128,17 @@ public class IndexingServiceImpl implements IndexingService {
             return;
         }
 
+        long executionStartedNanos = System.nanoTime();
         try {
             // Python 只接收 AI 服务需要的 DTO：对象存储位置、文档 id、
             // 归属元数据和 checksum。完整权限逻辑仍由 Java 掌握。
             AiDocumentIndexResponse response = aiDocumentIndexClient.indexDocument(toAiRequest(document, indexingTask));
             ensureIndexed(response, document, indexingTask);
-            log.info("AI indexing task indexed, documentId={}, taskId={}, aiStatus={}, pageCount={}, charCount={}, chunkCount={}, embeddedChunkCount={}, indexedChunkCount={}, vectorDim={}, vectorStore={}, vectorCollection={}, embeddingProvider={}, embeddingModel={}, message={}",
+            markSucceeded(document, indexingTask, response);
+
+            // 成功证据只能在 MySQL task/document 终态事务真正提交后记录。
+            // 否则迟到 worker 或 CAS 失败会留下与业务状态冲突的“成功”日志和指标。
+            log.info("AI indexing task succeeded, documentId={}, taskId={}, aiStatus={}, pageCount={}, charCount={}, chunkCount={}, embeddedChunkCount={}, indexedChunkCount={}, vectorDim={}, vectorStore={}, vectorCollection={}, embeddingProvider={}, embeddingModel={}, downloadLatencyMs={}, parseLatencyMs={}, splitLatencyMs={}, embeddingLatencyMs={}, vectorStoreLatencyMs={}, aiTotalLatencyMs={}, javaTotalLatencyMs={}",
                     document.getId(),
                     indexingTask.getId(),
                     response.status(),
@@ -136,14 +152,36 @@ public class IndexingServiceImpl implements IndexingService {
                     response.vectorCollection(),
                     response.embeddingProvider(),
                     response.embeddingModel(),
-                    response.message());
-            markSucceeded(document, indexingTask, response);
+                    response.downloadLatencyMs(),
+                    response.parseLatencyMs(),
+                    response.splitLatencyMs(),
+                    response.embeddingLatencyMs(),
+                    response.vectorStoreLatencyMs(),
+                    response.totalLatencyMs(),
+                    nanosToMillis(System.nanoTime() - executionStartedNanos));
+            recordSuccessfulIndexingObservability(
+                    document,
+                    response,
+                    executionStartedNanos
+            );
         } catch (RuntimeException ex) {
-            markFailed(document, indexingTask, ex, IndexingFailureStage.AI_PIPELINE, null);
+            boolean failureCommitted = markFailed(
+                    document,
+                    indexingTask,
+                    ex,
+                    IndexingFailureStage.AI_PIPELINE,
+                    null
+            );
+            if (failureCommitted) {
+                recordIndexingFailureMetric(executionStartedNanos, IndexingFailureStage.AI_PIPELINE);
+            }
         }
     }
 
     private void publishToQueue(IndexingQueueMessage message) {
+        String previousRequestId = RequestIdHolder.setRequestId(
+                RequestIdHolder.forIndexingTask(message.indexingTaskId())
+        );
         try {
             LocalDateTime publishAttemptAt = LocalDateTime.now();
             int claimed = indexingTaskMapper.update(null, new LambdaUpdateWrapper<IndexingTask>()
@@ -162,8 +200,10 @@ public class IndexingServiceImpl implements IndexingService {
             // 上传事务已经提交，MySQL 才是任务事实来源。这里不再把任务标记 FAILED，
             // 否则一次 MQ 瞬时故障就会让“已保存文件”变成“索引失败”。
             // 保持 indexing_task=PENDING，后续手动重试或简单扫描重投即可。
-            log.warn("Failed to publish indexing task to RabbitMQ, documentId={}, taskId={}, error={}",
-                    message.documentId(), message.indexingTaskId(), ex.getMessage(), ex);
+            log.warn("Failed to publish indexing task to RabbitMQ, documentId={}, taskId={}, errorType={}",
+                    message.documentId(), message.indexingTaskId(), ex.getClass().getSimpleName());
+        } finally {
+            RequestIdHolder.restoreRequestId(previousRequestId);
         }
     }
 
@@ -215,7 +255,7 @@ public class IndexingServiceImpl implements IndexingService {
         return Boolean.TRUE.equals(updated);
     }
 
-    private void markFailed(
+    private boolean markFailed(
             Document document,
             IndexingTask indexingTask,
             RuntimeException ex,
@@ -259,12 +299,58 @@ public class IndexingServiceImpl implements IndexingService {
         });
 
         if (Boolean.TRUE.equals(updated)) {
-            log.warn("AI indexing task failed, documentId={}, taskId={}, error={}",
-                    document.getId(), indexingTask.getId(), errorMessage);
-            return;
+            log.warn("AI indexing task failed, documentId={}, taskId={}, failureStage={}, errorType={}",
+                    document.getId(), indexingTask.getId(), failureStage, ex.getClass().getSimpleName());
+            return true;
         }
         log.info("Skip marking stale indexing failure because task is no longer RUNNING, documentId={}, taskId={}",
                 document.getId(), indexingTask.getId());
+        return false;
+    }
+
+    private void recordSuccessfulIndexingObservability(
+            Document document,
+            AiDocumentIndexResponse response,
+            long executionStartedNanos
+    ) {
+        try {
+            long embeddingLatencyMs = nonNegative(response.embeddingLatencyMs());
+            modelCallLogService.record(new ModelCallLogRecord(
+                    RequestIdHolder.getRequestId(),
+                    document.getOwnerUserId(),
+                    response.embeddingProvider(),
+                    response.embeddingModel(),
+                    ModelCallType.EMBEDDING,
+                    0,
+                    0,
+                    embeddingLatencyMs,
+                    true,
+                    null
+            ));
+            observabilityMetrics.recordModelCall(ModelCallType.EMBEDDING, "success", embeddingLatencyMs);
+            observabilityMetrics.recordIndexingAttempt(
+                    "success",
+                    "none",
+                    System.nanoTime() - executionStartedNanos
+            );
+        } catch (RuntimeException ex) {
+            // 指标或审计日志是旁路，绝不能把已提交的业务成功终态改写为失败。
+            log.warn("Failed to record successful indexing observability, documentId={}, taskId={}, errorType={}",
+                    document.getId(), document.getCurrentIndexingTaskId(), ex.getClass().getSimpleName());
+        }
+    }
+
+    private void recordIndexingFailureMetric(long executionStartedNanos, String failureStage) {
+        try {
+            observabilityMetrics.recordIndexingAttempt(
+                    "failure",
+                    failureStage,
+                    System.nanoTime() - executionStartedNanos
+            );
+        } catch (RuntimeException ex) {
+            log.warn("Failed to record indexing failure metric, failureStage={}, errorType={}",
+                    failureStage, ex.getClass().getSimpleName());
+        }
     }
 
     private void markTaskFailed(
@@ -404,6 +490,14 @@ public class IndexingServiceImpl implements IndexingService {
             return message;
         }
         return message.substring(0, MAX_ERROR_MESSAGE_LENGTH);
+    }
+
+    private long nonNegative(Long value) {
+        return value == null ? 0L : Math.max(0L, value);
+    }
+
+    private long nanosToMillis(long durationNanos) {
+        return Math.max(0L, durationNanos) / 1_000_000L;
     }
 
     private boolean isDeleted(Document document) {

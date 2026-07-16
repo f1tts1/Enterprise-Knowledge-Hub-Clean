@@ -2,6 +2,7 @@ package com.example.ekb.indexing.queue;
 
 import java.nio.charset.StandardCharsets;
 
+import com.example.ekb.common.utils.RequestIdHolder;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -32,17 +33,26 @@ public class IndexingQueueProducer {
     }
 
     public void publish(IndexingQueueMessage message) {
-        Message amqpMessage = MessageBuilder
-                .withBody(toJson(message).getBytes(StandardCharsets.UTF_8))
-                .setContentType(MessageProperties.CONTENT_TYPE_JSON)
-                .build();
-        rabbitTemplate.send(properties.getExchangeName(), properties.getRoutingKey(), amqpMessage);
-        log.info("Published indexing task to RabbitMQ, exchange={}, routingKey={}, queue={}, documentId={}, taskId={}",
-                properties.getExchangeName(),
-                properties.getRoutingKey(),
-                properties.getQueueName(),
-                message.documentId(),
-                message.indexingTaskId());
+        String correlationId = RequestIdHolder.forIndexingTask(message.indexingTaskId());
+        String previousRequestId = RequestIdHolder.setRequestId(correlationId);
+        try {
+            Message amqpMessage = MessageBuilder
+                    .withBody(toJson(message).getBytes(StandardCharsets.UTF_8))
+                    .setContentType(MessageProperties.CONTENT_TYPE_JSON)
+                    // 消息体继续只保存两个业务 ID。correlationId 是观测元数据，
+                    // 同一 PENDING attempt 重投时保持稳定，不参与业务状态判断。
+                    .setCorrelationId(correlationId)
+                    .build();
+            rabbitTemplate.send(properties.getExchangeName(), properties.getRoutingKey(), amqpMessage);
+            log.info("Published indexing task to RabbitMQ, exchange={}, routingKey={}, queue={}, documentId={}, taskId={}",
+                    properties.getExchangeName(),
+                    properties.getRoutingKey(),
+                    properties.getQueueName(),
+                    message.documentId(),
+                    message.indexingTaskId());
+        } finally {
+            RequestIdHolder.restoreRequestId(previousRequestId);
+        }
     }
 
     private String toJson(IndexingQueueMessage message) {

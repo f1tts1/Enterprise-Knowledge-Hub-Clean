@@ -20,7 +20,9 @@ Spring Boot 上传文档
   -> 删除文档时同步清理对应 Qdrant vectors
 ```
 
-当前已提供最小同步 RAG 问答接口：基于已索引 chunk 生成答案并返回引用片段。还没有 SSE 流式输出、会话引用落库、复杂 no-answer 判断、评测或 Agent 工作流。
+当前已提供最小同步 RAG 问答接口：基于已索引 chunk 生成答案并返回引用片段。还没有 SSE 流式输出、会话引用落库、复杂 no-answer 判断、正式评测系统或 Agent 工作流。
+
+当前也已落地 P0-2 基础可观测性：同步请求的 `X-Request-Id` 会从 Java 传播到 FastAPI 和外部 LLM；异步索引 attempt 使用稳定的 `index-task-{indexingTaskId}`；Python 返回索引、检索和 LLM 阶段耗时与 provider usage；Java 记录低基数 Micrometer 指标，并以 best-effort 方式写入 `model_call_log`。这些能力用于定位一次调用慢或失败在哪一段，不代表已经具备 Grafana 看板、告警、长期指标存储或正式 RAG 评测平台。
 
 ## 目录
 
@@ -109,6 +111,15 @@ http://localhost:8080/console/
 
 前端由 Spring Boot 同源提供，使用浏览器端路由组织登录页、注册页、登录后主布局、知识库工作台、文档与索引、向量检索和同步 RAG 问答页面。前端只调用 Java API；同步 RAG 问答通过 Java `/api/v1/knowledge-bases/{kbId}/rag/ask` 调用，前端不接触任何 LLM API Key，也不提供 SSE、历史会话或 Agent 页面。
 
+查看 Prometheus 文本指标：
+
+```bash
+curl http://localhost:8080/actuator/prometheus \
+  -H "Authorization: Bearer {accessToken}"
+```
+
+该端点没有匿名放行，仍受现有 JWT 安全链保护。项目没有恢复 `/health` 或 `/api/v1/health`；详细的关联规则、指标名、`model_call_log` 语义和排查查询见 `docs/OBSERVABILITY.md`。
+
 ## 当前测试入口
 
 权限检索端到端测试：
@@ -149,6 +160,8 @@ python3 scripts/run_rag_eval.py --retrieval-only
 
 如果 FastAPI 已配置可用 LLM，也可以去掉 `--retrieval-only` 运行完整 RAG 评测。评测会使用 `eval/rag/questions.jsonl` 中的固定问题集，输出 Recall@K、MRR、引用正确性、无答案识别和权限泄露检查结果。详细说明见 `docs/RAG_EVALUATION.md`。
 
+该固定集和脚本属于轻量回归基线，不是带实验管理、在线追踪、人工/LLM judge 流程的正式 RAG 评测系统；P0-2 不扩展这部分能力。
+
 可靠性验证矩阵：
 
 ```bash
@@ -168,6 +181,7 @@ cd enterprise-rag-backend && mvn -q -o test && cd ..
 - `docs/STATUS.md`：已完成、未完成、已知问题。
 - `docs/DECISIONS.md`：已确认技术决策。
 - `docs/API_CONTRACT.md`：Java/Python API 契约。
+- `docs/OBSERVABILITY.md`：requestId、阶段耗时、模型调用日志和低基数指标说明。
 - `docs/RAG_EVALUATION.md`：最小 RAG 评测基线。
 - `docs/RAG_EVALUATION_BASELINE.md`：当前 retrieval-only baseline 结果。
 - `docs/RELIABILITY_MATRIX.md`：异步索引、删除一致性和权限隔离可靠性矩阵。
