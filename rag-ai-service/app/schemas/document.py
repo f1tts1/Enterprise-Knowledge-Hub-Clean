@@ -44,6 +44,12 @@ class IndexDocumentResponse(BaseModel):
     vector_collection: str | None = None
     text_preview: str | None = None
     chunk_preview: str | None = None
+    download_latency_ms: int = Field(default=0, ge=0)
+    parse_latency_ms: int = Field(default=0, ge=0)
+    split_latency_ms: int = Field(default=0, ge=0)
+    embedding_latency_ms: int = Field(default=0, ge=0)
+    vector_store_latency_ms: int = Field(default=0, ge=0)
+    total_latency_ms: int = Field(default=0, ge=0)
 
 
 class DeleteDocumentVectorsRequest(BaseModel):

@@ -11,6 +11,7 @@ import org.springframework.scheduling.annotation.EnableScheduling;
         "com.example.ekb.knowledge.mapper",
         "com.example.ekb.document.mapper",
         "com.example.ekb.indexing.mapper",
+        "com.example.ekb.observability.mapper",
 //        "com.example.ekb.conversation.mapper"
 })
 @EnableRabbit

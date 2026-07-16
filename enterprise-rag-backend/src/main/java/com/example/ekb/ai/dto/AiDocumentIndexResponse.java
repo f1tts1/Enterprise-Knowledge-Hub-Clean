@@ -30,6 +30,12 @@ public record AiDocumentIndexResponse(
         @JsonProperty("vector_collection") String vectorCollection,
         // preview 只用于调试，不应作为业务正文持久化。
         @JsonProperty("text_preview") String textPreview,
-        @JsonProperty("chunk_preview") String chunkPreview
+        @JsonProperty("chunk_preview") String chunkPreview,
+        @JsonProperty("download_latency_ms") Long downloadLatencyMs,
+        @JsonProperty("parse_latency_ms") Long parseLatencyMs,
+        @JsonProperty("split_latency_ms") Long splitLatencyMs,
+        @JsonProperty("embedding_latency_ms") Long embeddingLatencyMs,
+        @JsonProperty("vector_store_latency_ms") Long vectorStoreLatencyMs,
+        @JsonProperty("total_latency_ms") Long totalLatencyMs
 ) {
 }

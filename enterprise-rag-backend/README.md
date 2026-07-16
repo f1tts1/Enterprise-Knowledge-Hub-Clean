@@ -15,12 +15,16 @@ Spring Boot 业务后端，负责 Enterprise Knowledge Hub 的用户、鉴权、
 - 知识库内向量检索入口：`POST /api/v1/knowledge-bases/{kbId}/retrieval/search`。
 - 检索前校验当前用户拥有知识库，并在返回前按 MySQL 未删除文档过滤命中结果。
 - 最小同步 RAG 问答：Java 复用权限过滤后的检索结果，Python 调用 OpenAI-compatible LLM 生成答案。
+- 入口 requestId 安全归一化并传播到 FastAPI；RabbitMQ 索引 attempt 使用稳定的 `index-task-{indexingTaskId}` 关联日志。
+- 索引、检索、RAG 和 Java→Python HTTP 调用记录低基数 Micrometer 指标；`model_call_log` 以 best-effort 方式记录 embedding/CHAT 调用耗时、结果和可用 token usage。
+- Actuator 只暴露 Prometheus 抓取端点，并继续受 JWT 鉴权保护。
 
 当前未实现：
 
 - SSE、Agent、多轮会话落库。
 - 自动重试失败索引任务。
 - Qdrant vectors 清理失败后的补偿任务或 outbox 重试机制。
+- Grafana 看板、告警、长期指标存储、LLM TTFT 和正式 RAG 评测平台。
 
 ## Local Run
 
@@ -61,6 +65,15 @@ SPRING_PROFILES_ACTIVE=local mvn spring-boot:run
 ```bash
 mvn -q -DskipTests -o compile
 ```
+
+查看 Prometheus 文本指标需要先登录取得 access token：
+
+```bash
+curl http://localhost:8080/actuator/prometheus \
+  -H "Authorization: Bearer {accessToken}"
+```
+
+`/actuator/prometheus` 没有匿名放行；当前仍没有 `/health` 或 `/api/v1/health`。指标只使用有限枚举标签，不把 requestId、用户或业务实体 ID 放入 tag。完整字段和排查方式见 `../docs/OBSERVABILITY.md`。
 
 ## 真实业务入口
 

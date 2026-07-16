@@ -87,6 +87,8 @@ FastAPI 按 ownerUserId + kbId + docId 删除 Qdrant points
 Spring Boot 删除 MinIO object -> document=DELETED
 ```
 
+可观测关联不改变上述业务边界：同步调用使用入口 `X-Request-Id` 串起 Java、FastAPI 和外部 LLM；异步索引在 RabbitMQ 边界切换为稳定的 `index-task-{indexingTaskId}`。FastAPI 把阶段耗时和 provider usage 通过内部 DTO 返回，Java 再记录结构化日志、低基数 Micrometer 指标和 best-effort `model_call_log`。
+
 ## 组件职责
 
 ### Spring Boot Backend
@@ -116,6 +118,10 @@ Spring Boot 删除 MinIO object -> document=DELETED
 - 对外提供知识库内向量检索入口，并在调用 Python 前校验当前用户拥有知识库。
 - 检索返回前会用 MySQL 未删除文档再过滤一次 Qdrant 命中结果，防止历史残留 vectors 被返回。
 - 对外提供最小同步 RAG 问答入口，复用检索结果后调用 Python 生成答案，并返回 citations/retrievedChunks。
+- 归一化入口 `X-Request-Id`，在 WebClient 调用 FastAPI 时继续传递，并在统一响应 body/header 和 MDC 日志中返回同一标识。
+- 为异步索引 attempt 生成稳定的 `index-task-{indexingTaskId}`，作为 RabbitMQ correlationId 和消费线程 MDC；RabbitMQ 消息体仍只包含业务 ID。
+- 记录索引、检索、RAG、模型调用和 Java→Python HTTP 耗时指标；标签只使用有限枚举，不包含 requestId 或业务实体 ID。
+- 在业务成功/失败语义明确时 best-effort 写入 `model_call_log`；可观测旁路失败不能改变已经提交的业务状态。
 
 ### FastAPI AI Service
 
@@ -133,8 +139,11 @@ Spring Boot 删除 MinIO object -> document=DELETED
 - 返回命中的 chunk、score、docId、pageNo、chunkIndex、charStart、charEnd、text。
 - 暴露 `POST /api/v1/rag/generate`，供 Java 在完成权限校验和 chunk 过滤后调用。
 - 通过 OpenAI-compatible Chat Completions 根据 Java 传入的上下文生成答案。
+- 校验或生成安全的 `X-Request-Id`，通过 `ContextVar` 隔离并发请求上下文，并在响应头与业务日志中返回。
+- 索引 pipeline 返回下载、解析、切分、embedding、Qdrant 写入和总耗时；检索返回 embedding、Qdrant 和总耗时。
+- RAG 生成向外部 LLM 继续传递 `X-Request-Id`，返回完整 LLM 调用耗时和 provider 可选 usage。
 
-FastAPI 当前不负责登录态、完整用户权限判断、会话保存或流式输出。RAG 生成只消费 Java 已过滤后的上下文，不自行访问 MySQL 或任意知识库。
+FastAPI 当前不负责登录态、完整用户权限判断、会话保存或流式输出。RAG 生成只消费 Java 已过滤后的上下文，不自行访问 MySQL 或任意知识库。Java→FastAPI 内部接口目前也没有独立服务 token/mTLS，仍依赖部署网络边界，不能直接暴露到不受信任网络。
 
 ### MySQL
 
@@ -144,6 +153,7 @@ FastAPI 当前不负责登录态、完整用户权限判断、会话保存或流
 - `knowledge_base`：个人知识库，当前只支持 owner 私有知识库。
 - `document`：文档元数据、MinIO 位置、索引状态、chunk 数；通过 `active_checksum_sha256` 生成列只对未删除文档做同知识库 checksum 去重。
 - `indexing_task`：文档索引任务状态。
+- `model_call_log`：成功的索引/检索 embedding 调用，以及已尝试的 CHAT 成功或失败记录；保存 requestId、provider/model、耗时、结果和可用 token usage。
 
 SQL 中还创建了以下表，但当前 Java 代码尚未使用：
 
@@ -151,9 +161,8 @@ SQL 中还创建了以下表，但当前 Java 代码尚未使用：
 - `chat_message`
 - `answer_citation`
 - `feedback`
-- `model_call_log`
 
-这些表是后续会话型 RAG、引用落库、反馈和模型调用记录的数据库基础，不属于当前已落地业务链路。
+这些尚未使用的表是后续会话型 RAG、引用落库和反馈的数据库基础，不属于当前已落地业务链路。
 
 ### RabbitMQ
 
@@ -168,6 +177,8 @@ SQL 中还创建了以下表，但当前 Java 代码尚未使用：
 - 消息字段：`documentId`、`indexingTaskId`
 
 Spring Boot 启动时通过 AMQP 声明 durable exchange、queue、DLX 和 DLQ。上传文档事务提交后，Spring Boot 向 RabbitMQ 发布 JSON 消息；消费者读取消息后调用 `IndexingService.processIndexingTask`。
+
+消息体继续只保存 `documentId`、`indexingTaskId`。生产者同时设置稳定的 AMQP correlationId `index-task-{indexingTaskId}`；消费者不信任消息属性中的任意 correlationId，而是从已经解析出的 taskId 重新计算同一标识。这样同一 PENDING attempt 的重投仍能关联到同一条异步执行链，又不会把上传 HTTP requestId 错当成跨时间任务标识。
 
 当前 Python 调用失败会落库为 `FAILED` 并 ack 消息，不依赖队列自动反复重试。消息格式错误、消费者自身异常或未能正常落库的异常会 `basicReject(requeue=false)` 进入 DLQ。上传后如果 RabbitMQ 发布失败，`indexing_task` 保持 `PENDING`，由简单 PENDING 任务重投器再次投递，也允许调用 `/api/v1/documents/{documentId}/index-retry` 手动重投同一任务。
 
@@ -268,9 +279,9 @@ RabbitMQ 消费者拿到消息后：
 
 1. 根据 `documentId`、`indexingTaskId` 查询 MySQL，校验 task/document 的 document、kb、owner 关联，并确认 task 是 current attempt。
 2. 将任务标记为 `RUNNING`，文档标记为 `INDEXING`。
-3. 通过 WebClient 调用 `POST http://localhost:8000/api/v1/documents/index`。
+3. 消费线程使用 `index-task-{indexingTaskId}` 写入 MDC，WebClient 以同一 `X-Request-Id` 调用 `POST http://localhost:8000/api/v1/documents/index`。
 4. Python 将 chunk/vector/payload 写入 Qdrant。
-5. Python 返回 `INDEXED` 和索引统计。
+5. Python 返回 `INDEXED`、索引统计和下载/解析/切分/embedding/Qdrant/总耗时。
 6. Java 校验响应回显的 `task_id/document_id` 以及 `indexed_chunk_count == chunk_count`。
 7. Java 更新 `document.chunk_count`，并写入 `INDEXED` / `SUCCESS`。
 8. 如果调用异常或响应不符合契约，Java 将 `document.index_status` 标记为 `INDEX_FAILED`，将 `indexing_task.status` 标记为 `FAILED`。
@@ -286,10 +297,10 @@ RabbitMQ 消费者拿到消息后：
 2. Java JWT 过滤器解析当前用户。
 3. Java 查询 `knowledge_base`，确认 `id=kbId`、`owner_user_id=currentUserId`、`is_deleted=0`。
 4. 校验失败时返回 `404001 Knowledge base not found`，不调用 Python。
-5. 校验成功后，Java 调用 `POST http://localhost:8000/api/v1/retrieval/search`。
+5. 校验成功后，Java 继续传递入口 `X-Request-Id`，调用 `POST http://localhost:8000/api/v1/retrieval/search`。
 6. Python 对 query 做 embedding。
 7. Python 调 Qdrant，filter 必须包含 `ownerUserId=currentUserId` 和 `kbId=kbId`。
-8. Python 返回 topK chunk。
+8. Python 返回 topK chunk，以及 embedding provider/model、embedding/Qdrant/总耗时。
 9. Java 根据返回的 `docId` 查询 MySQL，只保留当前用户、当前知识库、未删除且 `INDEXED` 文档的命中。
 10. Java 将过滤后的结果返回为统一 `ApiResponse`。
 
@@ -301,9 +312,10 @@ RabbitMQ 消费者拿到消息后：
 2. Java JWT 过滤器解析当前用户。
 3. Java 复用检索服务：先校验知识库 owner，再调用 Python 检索，并用 MySQL 二次过滤 chunk。
 4. 如果没有可用 chunk，Java 直接返回无上下文答案，不调用 LLM。
-5. 如果有可用 chunk，Java 将 question 和 chunk context 调用 `POST http://localhost:8000/api/v1/rag/generate`。
-6. Python 按 OpenAI-compatible Chat Completions 协议调用外部 LLM。
-7. Java 返回 answer、citations 和 retrievedChunks。
+5. 如果有可用 chunk，Java 将 question 和 chunk context 调用 `POST http://localhost:8000/api/v1/rag/generate`，并继续传递入口 `X-Request-Id`。
+6. Python 按 OpenAI-compatible Chat Completions 协议调用外部 LLM，并继续传递同一个 `X-Request-Id`。
+7. Python 返回 answer、provider/model、完整调用耗时和 provider 可选 usage；这里的耗时不是 TTFT。
+8. Java 返回 answer、citations 和 retrievedChunks，并 best-effort 记录 CHAT 调用。无上下文短路不会创建伪造的 CHAT 记录。
 
 当前 RAG 问答不写入 conversation、chat_message 或 answer_citation，也不提供 SSE。
 
@@ -325,6 +337,21 @@ RabbitMQ 消费者拿到消息后：
 ### Python 到 MinIO
 
 Python 根据 Java DTO 中的 `bucket` 和 `object_key` 下载文件。Python 不直接访问 MySQL，也不自行判断用户权限。
+
+## 基础可观测性
+
+当前可观测性服务于“解释一次索引、检索或问答慢/失败在哪一段”，不改变业务事实源：
+
+- 同步 Java API：合法客户端 `X-Request-Id` 原样使用；缺失、超过 64 字符或含不安全字符时生成 UUID。Java 响应、MDC、FastAPI 中间件和 LLM 下游 header 使用同一值。
+- 异步索引：从 RabbitMQ 发布开始改用 `index-task-{indexingTaskId}`。同一 PENDING attempt 重投保持稳定，新业务重试创建新 task，因此得到新的关联 ID。
+- Python 阶段字段：索引拆分为 download/parse/split/embedding/vector store/total；检索拆分为 embedding/vector store/total；非流式生成记录完整 LLM latency 和 provider usage。
+- Python 失败阶段：索引区分 download/parse/split/embedding/vector store，检索区分 embedding/vector store，生成区分 configuration/LLM HTTP/response parse；失败日志不打印异常正文或模型内容。
+- Java 结构化日志：只记录标识、状态、数量、provider/model、阶段耗时和异常类型，不记录问题、chunk、prompt、answer、Authorization 或 API Key。
+- `model_call_log`：记录成功的 indexing/retrieval embedding 和已发起的 CHAT 成功/失败。写库是 best-effort，写入异常只告警，不回滚索引或问答。
+- Micrometer：记录 Java→Python HTTP、已提交终态的索引 attempt、检索、RAG 分阶段、模型调用和 token 用量；只使用固定 application 与 operation/outcome/failure_stage/phase/type 等低基数标签。
+- Actuator：只暴露 `/actuator/prometheus`，并由现有 `.anyRequest().authenticated()` 规则要求 JWT。当前没有 health 接口。
+
+当前没有 Grafana dashboard、告警、长期指标存储或 LLM TTFT。现有固定问题集只属于轻量回归基线，不是正式 RAG 评测平台。字段、指标名和查询示例见 `OBSERVABILITY.md`。
 
 ## 当前状态流转
 
@@ -371,7 +398,8 @@ Java 只接受 `INDEXED` 作为索引成功。
 - 会话、消息、引用、反馈业务 API。
 - 复杂 no-answer 判断。
 - query rewrite、hybrid search、rerank、context compression。
-- 检索评测。
+- 正式 RAG 评测/实验平台（现有固定集只作为轻量回归基线）。
 - Agent 工作流。
 - Docker Compose 一键部署。
 - 完整 RBAC 或多租户。
+- Java→FastAPI 服务间 token/mTLS 鉴权。

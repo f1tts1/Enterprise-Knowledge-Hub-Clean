@@ -7,6 +7,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.example.ekb.common.constants.DocumentIndexStatus;
 import com.example.ekb.common.constants.IndexingTaskStatus;
+import com.example.ekb.common.utils.RequestIdHolder;
 import com.example.ekb.document.entity.Document;
 import com.example.ekb.document.mapper.DocumentMapper;
 import com.example.ekb.indexing.entity.IndexingTask;
@@ -63,7 +64,14 @@ public class PendingIndexingTaskRepublishScheduler {
         }
 
         for (IndexingTask task : tasks) {
-            republishIfDocumentStillWaiting(task);
+            String previousRequestId = RequestIdHolder.setRequestId(
+                    RequestIdHolder.forIndexingTask(task.getId())
+            );
+            try {
+                republishIfDocumentStillWaiting(task);
+            } finally {
+                RequestIdHolder.restoreRequestId(previousRequestId);
+            }
         }
     }
 
@@ -108,8 +116,8 @@ public class PendingIndexingTaskRepublishScheduler {
         } catch (RuntimeException ex) {
             // RabbitMQ 暂时不可用时继续保持 task=PENDING。下一轮再尝试即可，
             // 不因为队列依赖短暂失败而改写 MySQL 业务状态。
-            log.warn("Failed to republish pending indexing task to RabbitMQ, taskId={}, documentId={}, error={}",
-                    task.getId(), task.getDocumentId(), ex.getMessage(), ex);
+            log.warn("Failed to republish pending indexing task to RabbitMQ, taskId={}, documentId={}, errorType={}",
+                    task.getId(), task.getDocumentId(), ex.getClass().getSimpleName());
         }
     }
 

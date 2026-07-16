@@ -3,6 +3,7 @@ package com.example.ekb.config;
 import java.time.Duration;
 
 import io.netty.channel.ChannelOption;
+import com.example.ekb.observability.http.AiServiceObservabilityFilter;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -18,7 +19,8 @@ public class WebClientConfig {
             WebClient.Builder builder,
             @Value("${app.ai-service.base-url}") String baseUrl,
             @Value("${app.ai-service.connect-timeout-ms:2000}") int connectTimeoutMillis,
-            @Value("${app.ai-service.response-timeout-seconds:180}") long responseTimeoutSeconds
+            @Value("${app.ai-service.response-timeout-seconds:180}") long responseTimeoutSeconds,
+            AiServiceObservabilityFilter aiServiceObservabilityFilter
     ) {
         HttpClient httpClient = HttpClient.create()
                 // 连接超时保持较短：Python 服务没有启动时要快速失败，
@@ -33,6 +35,7 @@ public class WebClientConfig {
                 // 具体客户端只关心 endpoint 路径和 DTO 契约。
                 .baseUrl(baseUrl)
                 .clientConnector(new ReactorClientHttpConnector(httpClient))
+                .filter(aiServiceObservabilityFilter)
                 .build();
     }
 }

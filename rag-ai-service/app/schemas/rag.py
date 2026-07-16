@@ -26,3 +26,8 @@ class RagGenerateResponse(BaseModel):
     answer: str
     llm_provider: str
     llm_model: str
+    # 当前是非流式 Chat Completions，只记录完整调用耗时，不能描述为 TTFT。
+    llm_latency_ms: int = Field(ge=0)
+    prompt_tokens: int | None = Field(default=None, ge=0)
+    completion_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)

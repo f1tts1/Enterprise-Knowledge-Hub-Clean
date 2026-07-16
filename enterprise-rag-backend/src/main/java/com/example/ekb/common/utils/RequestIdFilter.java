@@ -1,8 +1,6 @@
 package com.example.ekb.common.utils;
 
 import java.io.IOException;
-import java.util.UUID;
-
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -11,7 +9,6 @@ import org.slf4j.MDC;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
-import org.springframework.util.StringUtils;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 @Component
@@ -24,10 +21,9 @@ public class RequestIdFilter extends OncePerRequestFilter {
             HttpServletResponse response,
             FilterChain filterChain
     ) throws ServletException, IOException {
-        String requestId = request.getHeader(RequestIdHolder.REQUEST_ID_HEADER);
-        if (!StringUtils.hasText(requestId)) {
-            requestId = UUID.randomUUID().toString();
-        }
+        String requestId = RequestIdHolder.normalizeOrGenerate(
+                request.getHeader(RequestIdHolder.REQUEST_ID_HEADER)
+        );
 
         // 同一个 requestId 会写入 MDC、响应头和 ApiResponse。
         // 这样前端截图里的 requestId 可以反查后端日志。

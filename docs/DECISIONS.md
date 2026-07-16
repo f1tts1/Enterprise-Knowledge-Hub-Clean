@@ -432,3 +432,32 @@
 
 - MySQL fencing 不能撤回已经发出的 Python HTTP 调用，也不宣称阻止旧 worker 触碰 Qdrant。稳定 point id 只提供幂等覆盖；旧调用若最后执行，仍可能覆盖或删除 current vectors。
 - 当前不实现自动指数退避业务重试、通用补偿平台或 task-aware Qdrant point 版本。
+
+## D24：可观测性采用 requestId 关联、阶段耗时和低基数指标，且保持旁路语义
+
+决策：同步 HTTP 请求使用安全归一化后的 `X-Request-Id` 关联 Java、FastAPI 和外部 LLM；异步索引 attempt 使用稳定的 `index-task-{indexingTaskId}`。Python 返回阶段耗时和 provider usage，Java 记录结构化日志、低基数 Micrometer 指标，并 best-effort 写入已有 `model_call_log`。
+
+当前约束：
+
+- Java 和 Python 都只接受最多 64 字符、匹配 `[A-Za-z0-9._:-]+` 的 requestId；非法或缺失值生成 UUID，避免日志注入。
+- 上传 HTTP 请求与后续异步 worker 不共享同一个短生命周期 requestId。RabbitMQ 消息体继续只保存两个业务 ID；correlationId 和消费 MDC 都由已持久化 taskId 确定性生成。
+- Python 索引拆分 download/parse/split/embedding/vector store/total，检索拆分 embedding/vector store/total，RAG 返回非流式 LLM 完整耗时和可选 token usage。
+- Python 异常路径记录有限的失败阶段和异常类型，但不记录异常正文、对象 key、query/question、prompt/context/answer 或凭证。
+- `model_call_log` 只记录有明确语义的模型调用：成功的索引/检索 embedding 与已经发起的 CHAT 成功/失败。无索引文档/无上下文短路不写伪造模型调用；下载、解析或 Qdrant 失败也不武断归类为 embedding 失败。
+- `model_call_log` 写入失败和指标记录失败不得反向影响已经提交的业务结果。错误字段做敏感内容识别、凭证脱敏和长度限制，不保存 prompt/question/chunk/answer 正文。
+- 指标标签只允许固定的 application 和 operation、outcome、failure_stage、phase、type 等有限集合，禁止把 requestId、userId、kbId、documentId、taskId 或错误全文做 tag。
+- Actuator 只暴露 `/actuator/prometheus`，并继续落入 Spring Security `.anyRequest().authenticated()`，不恢复 health 端点，也不为抓取端点新增匿名权限。
+
+原因：
+
+- 当前真正需要的是回答“一次请求慢/失败在哪一段”，requestId、阶段耗时、终态指标和模型调用记录已经足够形成可验证证据。
+- 用 taskId 关联异步执行比复制上传 requestId 更准确：一个 task 可被 PENDING 重投，而 FAILED 业务重试会创建新的 attempt。
+- 高基数业务标识留在日志和 MySQL 中，枚举维度留在时序指标中，可以避免 Prometheus series 数量随用户和文档增长。
+- best-effort 旁路避免观测系统故障改变索引状态机或用户问答结果。
+
+边界与放弃方案：
+
+- 当前不建设 Grafana dashboard、告警、长期指标存储或生产级 tracing 平台。
+- 当前同步生成只能记录完整 LLM latency，不记录 TTFT。
+- 当前不把调用日志字段扩展成正式 RAG 评测/实验平台；现有固定集仍只作为轻量回归基线。
+- FastAPI 内部接口尚未实现服务 token/mTLS，仍依赖部署网络边界；requestId 不是身份认证。该问题应作为独立安全边界处理，不能混入 P0-2 伪装完成。

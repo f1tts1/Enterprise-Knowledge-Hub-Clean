@@ -3,6 +3,8 @@ package com.example.ekb.indexing.service.impl;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -28,6 +30,9 @@ import com.example.ekb.document.mapper.DocumentMapper;
 import com.example.ekb.indexing.entity.IndexingTask;
 import com.example.ekb.indexing.mapper.IndexingTaskMapper;
 import com.example.ekb.indexing.queue.IndexingQueueProducer;
+import com.example.ekb.observability.metrics.AiObservabilityMetrics;
+import com.example.ekb.observability.model.ModelCallLogRecord;
+import com.example.ekb.observability.service.ModelCallLogService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -53,6 +58,10 @@ class IndexingServiceImplTest {
 
     private IndexingQueueProducer indexingQueueProducer;
 
+    private ModelCallLogService modelCallLogService;
+
+    private AiObservabilityMetrics observabilityMetrics;
+
     private IndexingServiceImpl indexingService;
 
     @BeforeAll
@@ -71,12 +80,16 @@ class IndexingServiceImplTest {
         indexingTaskMapper = subclassMock(IndexingTaskMapper.class);
         aiDocumentIndexClient = subclassMock(AiDocumentIndexClient.class);
         indexingQueueProducer = subclassMock(IndexingQueueProducer.class);
+        modelCallLogService = subclassMock(ModelCallLogService.class);
+        observabilityMetrics = subclassMock(AiObservabilityMetrics.class);
         indexingService = new IndexingServiceImpl(
                 documentMapper,
                 indexingTaskMapper,
                 aiDocumentIndexClient,
                 indexingQueueProducer,
-                immediateTransactionTemplate()
+                immediateTransactionTemplate(),
+                modelCallLogService,
+                observabilityMetrics
         );
     }
 
@@ -137,6 +150,9 @@ class IndexingServiceImplTest {
 
         Collection<Object> terminalTaskValues = captureLastTaskUpdateValues();
         assertThat(terminalTaskValues).contains(IndexingTaskStatus.SUCCESS);
+        verify(modelCallLogService).record(any(ModelCallLogRecord.class));
+        verify(observabilityMetrics).recordModelCall("EMBEDDING", "success", 40L);
+        verify(observabilityMetrics).recordIndexingAttempt(eq("success"), eq("none"), anyLong());
     }
 
     @Test
@@ -159,6 +175,33 @@ class IndexingServiceImplTest {
         Collection<Object> terminalTaskValues = captureLastTaskUpdateValues();
         assertThat(terminalTaskValues)
                 .contains(IndexingTaskStatus.FAILED, IndexingFailureStage.AI_PIPELINE);
+        verifyNoInteractions(modelCallLogService);
+        verify(observabilityMetrics).recordIndexingAttempt(
+                org.mockito.ArgumentMatchers.eq("failure"),
+                org.mockito.ArgumentMatchers.eq(IndexingFailureStage.AI_PIPELINE),
+                anyLong()
+        );
+        verify(observabilityMetrics, never()).recordModelCall(any(), any(), anyLong());
+    }
+
+    @Test
+    void shouldNotRecordSuccessWhenTerminalCasLosesRace() {
+        Document document = pendingDocument();
+        IndexingTask task = pendingTask();
+        when(documentMapper.selectById(DOCUMENT_ID)).thenReturn(document);
+        when(indexingTaskMapper.selectById(TASK_ID)).thenReturn(task);
+        // RUNNING claim succeeds, SUCCESS CAS loses, late failure CAS also becomes a no-op.
+        when(indexingTaskMapper.update(isNull(), any(LambdaUpdateWrapper.class)))
+                .thenReturn(1, 0, 0);
+        when(documentMapper.update(isNull(), any(LambdaUpdateWrapper.class))).thenReturn(1);
+        when(aiDocumentIndexClient.indexDocument(any(AiDocumentIndexRequest.class)))
+                .thenReturn(indexedResponse(TASK_ID, DOCUMENT_ID));
+
+        indexingService.processIndexingTask(DOCUMENT_ID, TASK_ID);
+
+        verify(indexingTaskMapper, times(3)).update(isNull(), any(LambdaUpdateWrapper.class));
+        verify(documentMapper, times(1)).update(isNull(), any(LambdaUpdateWrapper.class));
+        verifyNoInteractions(modelCallLogService, observabilityMetrics);
     }
 
     @SuppressWarnings({"rawtypes", "unchecked"})
@@ -218,7 +261,13 @@ class IndexingServiceImplTest {
                 "qdrant",
                 "knowledge_chunks",
                 "preview",
-                "chunk preview"
+                "chunk preview",
+                10L,
+                20L,
+                30L,
+                40L,
+                50L,
+                150L
         );
     }
 

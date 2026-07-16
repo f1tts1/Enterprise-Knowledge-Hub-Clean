@@ -11,16 +11,25 @@ import com.example.ekb.ai.dto.AiRetrievalSearchItem;
 import com.example.ekb.ai.dto.AiRetrievalSearchRequest;
 import com.example.ekb.ai.dto.AiRetrievalSearchResponse;
 import com.example.ekb.common.constants.DocumentIndexStatus;
+import com.example.ekb.common.utils.RequestIdHolder;
 import com.example.ekb.document.entity.Document;
 import com.example.ekb.document.mapper.DocumentMapper;
 import com.example.ekb.knowledge.access.KnowledgeBaseAccessService;
+import com.example.ekb.observability.metrics.AiObservabilityMetrics;
+import com.example.ekb.observability.model.ModelCallLogRecord;
+import com.example.ekb.observability.model.ModelCallType;
+import com.example.ekb.observability.service.ModelCallLogService;
 import com.example.ekb.retrieval.dto.RetrievalSearchRequest;
 import com.example.ekb.retrieval.dto.RetrievalSearchResponse;
 import com.example.ekb.retrieval.service.RetrievalService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 @Service
 public class RetrievalServiceImpl implements RetrievalService {
+
+    private static final Logger log = LoggerFactory.getLogger(RetrievalServiceImpl.class);
 
     private static final int NOT_DELETED = 0;
     private static final int DEFAULT_TOP_K = 5;
@@ -31,43 +40,157 @@ public class RetrievalServiceImpl implements RetrievalService {
     private final KnowledgeBaseAccessService knowledgeBaseAccessService;
     private final DocumentMapper documentMapper;
     private final AiRetrievalSearchClient aiRetrievalSearchClient;
+    private final ModelCallLogService modelCallLogService;
+    private final AiObservabilityMetrics observabilityMetrics;
 
     public RetrievalServiceImpl(
             KnowledgeBaseAccessService knowledgeBaseAccessService,
             DocumentMapper documentMapper,
-            AiRetrievalSearchClient aiRetrievalSearchClient
+            AiRetrievalSearchClient aiRetrievalSearchClient,
+            ModelCallLogService modelCallLogService,
+            AiObservabilityMetrics observabilityMetrics
     ) {
         this.knowledgeBaseAccessService = knowledgeBaseAccessService;
         this.documentMapper = documentMapper;
         this.aiRetrievalSearchClient = aiRetrievalSearchClient;
+        this.modelCallLogService = modelCallLogService;
+        this.observabilityMetrics = observabilityMetrics;
     }
 
     @Override
     public RetrievalSearchResponse search(Long currentUserId, Long knowledgeBaseId, RetrievalSearchRequest request) {
-        // Java 是业务权限主边界：先确认当前用户拥有知识库，再允许调用 Python。
-        // Python 不理解登录态，只接收 Java 已确认过的 ownerUserId/kbId。
-        ensureOwnedKnowledgeBase(currentUserId, knowledgeBaseId);
+        long startedNanos = System.nanoTime();
+        try {
+            // Java 是业务权限主边界：先确认当前用户拥有知识库，再允许调用 Python。
+            // Python 不理解登录态，只接收 Java 已确认过的 ownerUserId/kbId。
+            ensureOwnedKnowledgeBase(currentUserId, knowledgeBaseId);
 
-        String query = request.query().trim();
-        Integer topK = request.topK() == null ? DEFAULT_TOP_K : request.topK();
-        if (!hasIndexedDocuments(currentUserId, knowledgeBaseId)) {
-            return new RetrievalSearchResponse(
+            String query = request.query().trim();
+            Integer topK = request.topK() == null ? DEFAULT_TOP_K : request.topK();
+            if (!hasIndexedDocuments(currentUserId, knowledgeBaseId)) {
+                RetrievalSearchResponse emptyResponse = new RetrievalSearchResponse(
+                        query,
+                        topK,
+                        VECTOR_STORE_QDRANT,
+                        null,
+                        List.of()
+                );
+                recordRetrievalOutcome(
+                        "no_indexed_documents",
+                        startedNanos,
+                        currentUserId,
+                        knowledgeBaseId,
+                        topK,
+                        topK,
+                        0,
+                        null
+                );
+                return emptyResponse;
+            }
+
+            Integer aiTopK = overFetchTopK(topK);
+            AiRetrievalSearchResponse response = aiRetrievalSearchClient.search(new AiRetrievalSearchRequest(
+                    currentUserId,
+                    knowledgeBaseId,
                     query,
+                    aiTopK
+            ));
+            AiRetrievalSearchResponse filtered = filterActiveDocumentHits(
+                    currentUserId,
+                    knowledgeBaseId,
                     topK,
-                    VECTOR_STORE_QDRANT,
-                    null,
-                    List.of()
+                    response
             );
+            RetrievalSearchResponse result = RetrievalSearchResponse.from(filtered);
+            int hitCount = result.records() == null ? 0 : result.records().size();
+            recordSuccessfulEmbeddingCall(currentUserId, response);
+            recordRetrievalOutcome(
+                    "success",
+                    startedNanos,
+                    currentUserId,
+                    knowledgeBaseId,
+                    topK,
+                    aiTopK,
+                    hitCount,
+                    response
+            );
+            return result;
+        } catch (RuntimeException ex) {
+            recordRetrievalFailure(startedNanos, currentUserId, knowledgeBaseId, ex);
+            throw ex;
         }
+    }
 
-        Integer aiTopK = overFetchTopK(topK);
-        AiRetrievalSearchResponse response = aiRetrievalSearchClient.search(new AiRetrievalSearchRequest(
-                currentUserId,
-                knowledgeBaseId,
-                query,
-                aiTopK
-        ));
-        return RetrievalSearchResponse.from(filterActiveDocumentHits(currentUserId, knowledgeBaseId, topK, response));
+    private void recordSuccessfulEmbeddingCall(Long currentUserId, AiRetrievalSearchResponse response) {
+        try {
+            long embeddingLatencyMs = nonNegative(response.embeddingLatencyMs());
+            modelCallLogService.record(new ModelCallLogRecord(
+                    RequestIdHolder.getRequestId(),
+                    currentUserId,
+                    response.embeddingProvider(),
+                    response.embeddingModel(),
+                    ModelCallType.EMBEDDING,
+                    0,
+                    0,
+                    embeddingLatencyMs,
+                    true,
+                    null
+            ));
+            observabilityMetrics.recordModelCall(ModelCallType.EMBEDDING, "success", embeddingLatencyMs);
+        } catch (RuntimeException ex) {
+            log.warn("Failed to record retrieval embedding observability, errorType={}",
+                    ex.getClass().getSimpleName());
+        }
+    }
+
+    private void recordRetrievalOutcome(
+            String outcome,
+            long startedNanos,
+            Long currentUserId,
+            Long knowledgeBaseId,
+            Integer requestedTopK,
+            Integer aiTopK,
+            int hitCount,
+            AiRetrievalSearchResponse aiResponse
+    ) {
+        long durationNanos = System.nanoTime() - startedNanos;
+        try {
+            observabilityMetrics.recordRetrieval(outcome, durationNanos, hitCount);
+            log.info("Retrieval completed, outcome={}, userId={}, kbId={}, requestedTopK={}, aiTopK={}, hitCount={}, embeddingLatencyMs={}, vectorStoreLatencyMs={}, aiTotalLatencyMs={}, javaTotalLatencyMs={}",
+                    outcome,
+                    currentUserId,
+                    knowledgeBaseId,
+                    requestedTopK,
+                    aiTopK,
+                    hitCount,
+                    aiResponse == null ? null : aiResponse.embeddingLatencyMs(),
+                    aiResponse == null ? null : aiResponse.vectorStoreLatencyMs(),
+                    aiResponse == null ? null : aiResponse.totalLatencyMs(),
+                    nanosToMillis(durationNanos));
+        } catch (RuntimeException ex) {
+            log.warn("Failed to record retrieval observability, outcome={}, errorType={}",
+                    outcome, ex.getClass().getSimpleName());
+        }
+    }
+
+    private void recordRetrievalFailure(
+            long startedNanos,
+            Long currentUserId,
+            Long knowledgeBaseId,
+            RuntimeException failure
+    ) {
+        long durationNanos = System.nanoTime() - startedNanos;
+        try {
+            observabilityMetrics.recordRetrieval("failure", durationNanos, 0);
+            log.warn("Retrieval failed, userId={}, kbId={}, javaTotalLatencyMs={}, errorType={}",
+                    currentUserId,
+                    knowledgeBaseId,
+                    nanosToMillis(durationNanos),
+                    failure.getClass().getSimpleName());
+        } catch (RuntimeException observabilityFailure) {
+            log.warn("Failed to record retrieval failure metric, errorType={}",
+                    observabilityFailure.getClass().getSimpleName());
+        }
     }
 
     private void ensureOwnedKnowledgeBase(Long currentUserId, Long knowledgeBaseId) {
@@ -97,7 +220,12 @@ public class RetrievalServiceImpl implements RetrievalService {
                             requestedTopK,
                             response.vectorStore(),
                             response.vectorCollection(),
-                            List.of()
+                            List.of(),
+                            response.embeddingProvider(),
+                            response.embeddingModel(),
+                            response.embeddingLatencyMs(),
+                            response.vectorStoreLatencyMs(),
+                            response.totalLatencyMs()
                     );
         }
 
@@ -120,7 +248,12 @@ public class RetrievalServiceImpl implements RetrievalService {
                     requestedTopK,
                     response.vectorStore(),
                     response.vectorCollection(),
-                    List.of()
+                    List.of(),
+                    response.embeddingProvider(),
+                    response.embeddingModel(),
+                    response.embeddingLatencyMs(),
+                    response.vectorStoreLatencyMs(),
+                    response.totalLatencyMs()
             );
         }
 
@@ -145,11 +278,24 @@ public class RetrievalServiceImpl implements RetrievalService {
                 requestedTopK,
                 response.vectorStore(),
                 response.vectorCollection(),
-                activeRecords
+                activeRecords,
+                response.embeddingProvider(),
+                response.embeddingModel(),
+                response.embeddingLatencyMs(),
+                response.vectorStoreLatencyMs(),
+                response.totalLatencyMs()
         );
     }
 
     private Integer overFetchTopK(Integer requestedTopK) {
         return Math.min(MAX_TOP_K, requestedTopK * OVER_FETCH_MULTIPLIER);
+    }
+
+    private long nonNegative(Long value) {
+        return value == null ? 0L : Math.max(0L, value);
+    }
+
+    private long nanosToMillis(long durationNanos) {
+        return Math.max(0L, durationNanos) / 1_000_000L;
     }
 }

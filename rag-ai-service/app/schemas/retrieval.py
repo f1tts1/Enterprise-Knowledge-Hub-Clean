@@ -37,6 +37,11 @@ class RetrievalSearchItem(BaseModel):
 class RetrievalSearchResponse(BaseModel):
     query: str
     top_k: int
+    embedding_provider: str
+    embedding_model: str | None = None
     vector_store: str
     vector_collection: str
+    embedding_latency_ms: int = Field(default=0, ge=0)
+    vector_store_latency_ms: int = Field(default=0, ge=0)
+    total_latency_ms: int = Field(default=0, ge=0)
     records: list[RetrievalSearchItem]

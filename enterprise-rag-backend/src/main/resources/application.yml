@@ -36,6 +36,21 @@ mybatis-plus:
 server:
   port: 8080
 
+# P0-2 只暴露 Prometheus 抓取端点；不把 health 恢复成业务演示入口，
+# 也不在指标标签中放 requestId、userId、kbId、documentId 等高基数字段。
+management:
+  endpoints:
+    web:
+      exposure:
+        include: prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} [requestId=%X{requestId:-none}] - %msg%n"
+
 app:
   security:
     jwt:
