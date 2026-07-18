@@ -1,0 +1,19 @@
+Alice 项目边界与不做事项说明文档。
+
+Enterprise Knowledge Hub 当前定位是企业知识库 RAG + Java 后端工程化项目，不是大模型预训练平台，也不是纯算法研究项目。项目目标是展示 Java 后端、Python AI 服务协作、RAG 工程链路、权限隔离、异步任务和可观测性。
+
+当前没有使用 Kafka。文档索引异步队列使用 RabbitMQ，exchange 是 `ekb.indexing.exchange`，队列是 `ekb.indexing.tasks`。由于当前规模不需要 Kafka 的复杂集群能力，继续使用 RabbitMQ 更符合个人项目的复杂度边界。
+
+当前没有 Kubernetes、服务网格、注册中心或 Elasticsearch。部署优先补 Docker Compose，一键启动 MySQL、Redis、MinIO、Qdrant、FastAPI 和 Spring Boot。除非评测证明 dense retrieval 无法处理关键词召回，否则不引入 Elasticsearch。
+
+当前没有实现 SSE 流式输出。RAG 问答是同步接口，返回 answer、citations 和 retrievedChunks。由于求职主线更需要评测、可靠性和权限证据，SSE 不是下一阶段必须能力，也没有定义任何 SSE event 格式。
+
+当前没有完整 RBAC、多租户或团队空间。权限模型采用 owner 私有知识库，依赖 knowledge_base.owner_user_id 和 document.owner_user_id。role_permission 表没有落地，完整 RBAC 暂缓。
+
+当前没有 Agent 工作流。普通文档索引、检索和问答更适合固定 Service 编排，不应该为了使用 LangGraph 而包装成 Agent。只有当 RAG bad case 诊断或受控审批工作流能形成独立价值时，才考虑一个受控工作流。
+
+当前没有 hybrid search、rerank、query rewrite 和 context compression。它们必须由评测结果驱动，而不是为了技术栈丰富度盲目加入。第一优先级是建立 baseline、分析 bad case、再决定是否增加检索优化模块。
+
+项目停止开发的条件也要清楚。完成 RAG 主链路、权限隔离、可靠性失败矩阵、基础评测、部署说明和核心面试材料后，就应该停止继续堆功能。继续增加没有验证的模块，会降低项目可信度。
+
+简历中也不应该写未完成能力。没有落地的 Agent、SSE、多轮会话、完整 RBAC、hybrid、rerank 和 query rewrite 都只能写成后续规划，不能写成已实现。

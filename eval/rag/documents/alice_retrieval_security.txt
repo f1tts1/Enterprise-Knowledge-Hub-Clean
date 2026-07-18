@@ -1,0 +1,17 @@
+Alice 检索权限和引用说明文档。
+
+知识库检索入口由 Spring Boot 对外提供。Java 在调用 Python 检索前，必须先查询 knowledge_base，确认 kbId 属于当前登录用户，并且 knowledge_base.is_deleted 等于 0。访问其他用户知识库时，Java 返回 404001 Knowledge base not found，避免泄露资源是否存在。
+
+Python 检索接口不处理完整登录态，但必须把 Java 传入的 ownerUserId 和 kbId 下推到 Qdrant filter。Qdrant 查询时同时过滤 ownerUserId 和 kbId，防止向量召回跨用户或跨知识库的数据。
+
+Java 收到 Qdrant 命中后，还会按 MySQL 二次过滤：只保留 owner_user_id 等于当前用户、kb_id 等于当前知识库、is_deleted 等于 0、index_status 等于 INDEXED 的文档命中。这个过滤用于防止删除残留 vectors 或半完成索引被返回。
+
+检索结果返回 topK chunk。为了抵消 MySQL 二次过滤丢弃部分 Qdrant 命中的影响，Java 会向 Python 适度 over-fetch，当前倍率是 3，最大不超过 20。
+
+Qdrant payload 中保存 pageNo、chunkIndex、charStart、charEnd 和 text。RAG 引用可以用这些字段展示具体来源。每个 point id 由 documentId 和 chunkIndex 确定性生成；重试索引会先按 ownerUserId、kbId、docId 删除旧 point，再 upsert 新 point，避免重复向量和高序号旧 chunk 残留。
+
+权限隔离评测不能只检查 HTTP 状态码。检索结果、RAG citations 和最终 answer 都必须检查 forbidden terms，确认 Alice 的结果中不会出现 Bob 的财务、人事或合同私有关键词。权限泄露率应当为 0。
+
+当用户在自己的知识库里询问其它用户的私有关键词时，系统可以返回无关结果或说明知识库内容不足，但不能返回其它用户的 docId、chunkId、fileName 或 text。这个场景用于验证 Qdrant filter 和 Java 二次过滤是否同时生效。
+
+检索评测还要区分“命中文档”和“命中证据”。如果 topK 里出现了正确 docId，但返回的是同一文档里无关的 chunk，RAG 仍可能答错。因此 baseline 同时记录文档级 Recall@K 和 Evidence Hit Rate，后者会检查检索文本是否包含关键证据词。

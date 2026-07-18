@@ -1,0 +1,15 @@
+Alice 可靠性与可观测性说明文档。
+
+当前系统已经在 Java 入口生成 requestId。客户端可以传入 X-Request-Id，如果没有传入，Java 后端会生成 UUID，并把 requestId 写入响应头、ApiResponse body 和日志 MDC。这样前端截图、curl 输出和后端日志可以关联到同一次请求。
+
+下一阶段最需要补充的是跨服务 requestId 透传。Java 使用 WebClient 调用 FastAPI 时，应把 X-Request-Id 一起传给 Python。Python 日志也应打印 request_id、document_id、task_id、kb_id 和 owner_user_id。这样索引失败或 RAG 生成失败时，可以从 Java 请求一路追到 FastAPI pipeline。
+
+索引链路至少需要记录四类耗时：MinIO 下载耗时、文档解析与切分耗时、embedding 耗时、Qdrant upsert 耗时。检索链路至少需要记录 query embedding 耗时、Qdrant search 耗时和 Java MySQL 二次过滤耗时。RAG 生成链路至少需要记录检索耗时、LLM 调用耗时、总耗时和 LLM provider/model。
+
+模型调用日志不应该一开始做成复杂审计平台。最小实现只需要记录 request_id、user_id、provider、model、call_type、latency_ms、success、error_message、prompt_tokens 和 completion_tokens。当前 SQL 中已经有 model_call_log 表，但业务代码还没有落地写入。
+
+可靠性指标应聚焦真实链路：索引成功率、索引失败率、平均索引耗时、人工重试成功率、删除失败次数、RAG 调用成功率、LLM 调用失败率、权限泄露次数。Prometheus 和 Grafana 可以后置，第一阶段用日志和评测 summary 就能说明问题。
+
+不建议为了简历装饰直接加入复杂 tracing、服务网格或分布式监控平台。当前项目规模下，能解释一次上传索引、一次检索、一次 RAG 问答为什么慢，比堆很多监控组件更有面试价值。
+
+重复消息和迟到结果也需要可观测。RabbitMQ 可能重复投递同一 documentId 和 indexingTaskId，消费者通过 task=PENDING 条件更新和 document.current_indexing_task_id fencing 保证幂等。旧 worker 在超时或人工重试后迟到返回时，Java 只允许仍然匹配 current task 的结果覆盖 document 状态。

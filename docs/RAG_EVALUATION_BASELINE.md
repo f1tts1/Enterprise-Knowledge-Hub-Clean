@@ -1,13 +1,15 @@
-# RAG 评测 Baseline 结果
+# 历史 RAG 评测 Baseline 结果
 
-本文档记录当前可复现的 RAG 评测 baseline。当前已经保留两次结果：
+> **证据状态：历史摘要，不代表当前提交。** 下面两次运行发生在结构化 no-answer、实际引用语义和当前固定语料修订之前。旧协议通过答案关键词识别拒答，并把检索候选整体映射为 citations；因此旧的 no-answer/citation 数值不能与当前协议直接比较。`eval/rag/results/` 被 Git 忽略，新 clone 不包含当时原始 JSONL；本文件只保留历史摘要，必须重跑后才能形成新的求职证据。
+
+本文档保留两次历史 baseline：
 
 - 2026-06-28：retrieval-only baseline，用于确认检索、证据覆盖和权限过滤。
 - 2026-06-29：完整 RAG baseline，用于确认检索、生成、引用、无答案和权限表现。
 
 ## 2026-06-29 完整 RAG Baseline
 
-原始输出位于：
+当时本地输出路径（不随 Git 提交）：
 
 ```text
 eval/rag/results/20260629160711_29294_1789fb/
@@ -47,18 +49,18 @@ eval/rag/results/20260629160711_29294_1789fb/
 | 无答案型 | 4 | 未评分 | 0 |
 | 权限隔离型 | 6 | 未评分 | 3 |
 
-### 结果解读
+### 历史结果解读
 
-完整 RAG baseline 说明当前主链路已经具备可展示价值：40 条有标准证据的问题全部在 top5 内召回期望文档，引用命中率为 1.0，答案关键事实命中率为 0.925。
+当时的完整 RAG baseline 中，40 条有标准证据的问题全部在 top5 内召回期望文档，答案关键事实启发式命中率为 0.925。旧 `Citation Correct Rate=1.0` 是“全部检索候选都被映射为 citations”协议下的数值，不能用来证明当前“答案实际引用”的正确率。
 
-本次没有发现真实的跨用户检索泄露。逐题结果显示：
+当次结果没有发现跨用户检索命中泄露。逐题结果显示：
 
 - `forbidden_leak_retrieval=0`
 - 3 个 `rag_forbidden_term_leak` 都来自答案复述用户问题中的敏感词，而不是检索结果或 citation 召回了对方知识库内容。
 
-因此，`permission.pass_rate=0.94` 和 `forbidden_leak_count=3` 应解释为当前评测口径偏严格：脚本把“no-answer 回答里复述用户问题中的 forbidden term”也计入泄露。安全结论不能简单写成“权限泄露 3 次”，更准确的说法是：
+因此，历史 `permission.pass_rate=0.94` 和 `forbidden_leak_count=3` 应解释为旧评测口径把“no-answer 回答里复述用户问题中的 forbidden term”也计入泄露。安全结论不能简单写成“权限泄露 3 次”，更准确的历史表述是：
 
-> 检索权限隔离通过；RAG no-answer 回答会复述用户问题中的敏感实体，导致当前 forbidden term 规则出现 3 个问题回显型 false positive。
+> 当时的检索权限隔离通过；RAG no-answer 回答会复述用户问题中的敏感实体，导致旧 forbidden term 规则出现 3 个问题回显型 false positive。
 
 ### Bad Cases
 
@@ -72,13 +74,13 @@ eval/rag/results/20260629160711_29294_1789fb/
 | Q034 | permission | `rag_forbidden_term_leak`、`no_answer_not_recognized`、`permission_leak` | 答案拒答正确，但复述了问题中的 `ownerUserId/Qdrant filter`。 |
 | Q048 | permission | `rag_forbidden_term_leak`、`no_answer_not_recognized`、`permission_leak` | 答案拒答正确，但复述了问题中的“银桦协议”。 |
 
-### 当前结论
+### 当时结论及当前限制
 
-1. 当前 dense retrieval 和引用链路已经足够作为完整 RAG baseline。
-2. 现在不应因为 3 个 permission bad case 直接判断权限过滤失败；真实检索泄露为 0。
-3. 下一步最值得优化的是评测脚本口径：把 `answer_question_echo` 和真实 `answer_source_forbidden_leak` 拆开。
-4. Prompt 可以补一条 no-answer 规则：拒答时尽量不复述用户输入中的敏感实体。
-5. 暂不建议实现 hybrid、rerank 或 query rewrite；当前 bad case 还没有证明 dense retrieval 召回不足。
+1. 这次运行支持“当时 dense retrieval 在固定集上可用”，不证明当前协议或修订语料的结果。
+2. 3 个 permission bad case 不能解释成检索权限过滤失败；当时 `forbidden_leak_retrieval=0`。
+3. 当前脚本已经拆分 `answer_question_echo`、检索候选、citation 与答案来源泄露，且 no-answer 改为结构化状态；这两项实现变化尚未在本文件记录的新运行中验证。
+4. 当前 citations 只返回答案实际采用且编号有效的 chunk；旧 Citation Correct Rate 不再是当前证据。
+5. 历史 bad case 仍没有给出优先引入 hybrid、rerank 或 query rewrite 的依据。
 
 ## 2026-06-28 Retrieval-only Baseline
 
@@ -122,9 +124,9 @@ eval/rag/results/20260628171204_81528_b62629/
 | 无答案型 | 4 | 未评分 | 0 |
 | 权限隔离型 | 6 | 未评分 | 0 |
 
-### 结果解读
+### 历史结果解读
 
-第一版 dense retrieval baseline 是可用的：所有 40 条有期望证据的问题都在 top5 内召回了期望文档，权限隔离题没有出现 Bob 私有关键词泄露。
+第一版 dense retrieval baseline 在当时环境中可用：所有 40 条有期望证据的问题都在 top5 内召回了期望文档，权限隔离题没有出现 Bob 私有关键词泄露。
 
 MRR 为 0.8871，说明大多数问题能把期望文档排到第一，但多段组合和改写问题仍有排序空间。具体看，40 条检索题中 33 条首个相关文档排名第 1，另外 7 条排在第 2 到第 5。
 
@@ -154,22 +156,22 @@ Evidence Hit Rate 为 0.95，说明存在“命中文档但关键证据词不完
 
 判断：文档级召回正确，但 `evidence_terms` 标注较严格，检索结果没有同时覆盖所有期望词。这个 bad case 更适合用于改进 evidence 标注或后续做 rerank/context 选择，而不是说明 dense retrieval 失效。
 
-### 当前结论
+### 当时结论
 
-1. 当前 dense retrieval 已经足够作为第一版 RAG baseline。
-2. 现在不应直接上 hybrid search；没有看到关键词或编号类召回失败。
-3. 现在也不急着上 query rewrite；改写题 Recall@5 仍为 1.0。
+1. 当时 dense retrieval 足够建立第一版 retrieval-only baseline。
+2. 当时没有直接上 hybrid search 的证据；没有看到关键词或编号类召回失败。
+3. 当时也没有优先上 query rewrite 的证据；改写题 Recall@5 为 1.0。
 4. 如果要优化，优先看排序和 evidence coverage，而不是新增大组件。
-5. 后续完整 RAG 评测已在 2026-06-29 完成，结果见本文上一节。
+5. 后续完整 RAG 历史评测于 2026-06-29 完成，结果见本文上一节。
 
-## 下一步建议
+## 当前重建 Baseline 的顺序
 
-优先级从高到低：
+2026-07-17 后协议已改为 `ANSWERED/NO_CONTEXT/INSUFFICIENT_CONTEXT`，并区分 `retrievedChunks` 与实际 `citations`。固定评测资产当前存在，脚本也已拆分泄露来源，但本文件没有记录新协议的实际 E2E 运行。下一次应：
 
-1. 修正权限评测口径：区分问题回显、检索泄露、引用泄露和答案基于来源的泄露。
-2. 对照 topK：跑 `topK=3`、`topK=5`、`topK=8`，观察 MRR、Evidence Hit Rate 和上下文噪声变化。
-3. 调整 evidence 标注：对 Q019、Q024 这类多证据问题，区分“必须全部命中”和“命中任一关键证据即可”。
-4. 根据修正后的 bad case 再决定是否实现相似度阈值或 rerank。
+1. 先执行 `./scripts/verify.sh`，确认固定资产和双端 DTO 契约通过确定性检查。
+2. 在完整本地环境中重跑 retrieval-only，记录当前提交、模型和配置。
+3. 配置真实 LLM 后重跑完整 RAG，使用结构化状态、实际 citations 和分离后的泄露字段生成新 baseline。
+4. 新 baseline 建立后再决定是否对照 `topK=3/5/8`；不得把本页旧数字改名成新结果。
 
 暂不建议：
 
@@ -177,3 +179,4 @@ Evidence Hit Rate 为 0.95，说明存在“命中文档但关键证据词不完
 - 暂不实现 query rewrite。
 - 暂不引入 rerank 模型。
 - 暂不扩大评测集规模。
+- 暂不启用未经新数据校准的全局相似度阈值；当前配置默认关闭。

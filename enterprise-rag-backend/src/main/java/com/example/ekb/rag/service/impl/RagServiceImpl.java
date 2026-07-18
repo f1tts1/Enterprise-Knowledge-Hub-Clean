@@ -1,13 +1,15 @@
 package com.example.ekb.rag.service.impl;
 
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Objects;
-import java.util.stream.IntStream;
+import java.util.Set;
 
 import com.example.ekb.ai.client.AiRagGenerateClient;
 import com.example.ekb.ai.dto.AiRagContextChunk;
 import com.example.ekb.ai.dto.AiRagGenerateRequest;
 import com.example.ekb.ai.dto.AiRagGenerateResponse;
+import com.example.ekb.common.enums.ErrorCode;
+import com.example.ekb.common.exception.BusinessException;
 import com.example.ekb.common.utils.RequestIdHolder;
 import com.example.ekb.observability.metrics.AiObservabilityMetrics;
 import com.example.ekb.observability.model.ModelCallLogRecord;
@@ -23,6 +25,7 @@ import com.example.ekb.retrieval.dto.RetrievalSearchResponse;
 import com.example.ekb.retrieval.service.RetrievalService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
@@ -32,23 +35,33 @@ public class RagServiceImpl implements RagService {
     private static final Logger log = LoggerFactory.getLogger(RagServiceImpl.class);
 
     private static final int DEFAULT_TOP_K = 5;
+    private static final String ANSWERED = "ANSWERED";
+    private static final String NO_CONTEXT = "NO_CONTEXT";
+    private static final String INSUFFICIENT_CONTEXT = "INSUFFICIENT_CONTEXT";
+    private static final String NO_RETRIEVED_CONTEXT = "NO_RETRIEVED_CONTEXT";
+    private static final String NO_USABLE_CONTEXT = "NO_USABLE_CONTEXT";
+    private static final String LOW_RELEVANCE = "LOW_RELEVANCE";
     private static final String NO_CONTEXT_ANSWER = "当前知识库没有可用于回答该问题的已索引内容。";
+    private static final String LOW_RELEVANCE_ANSWER = "当前知识库检索结果与问题的相关性不足，无法回答。";
 
     private final RetrievalService retrievalService;
     private final AiRagGenerateClient aiRagGenerateClient;
     private final ModelCallLogService modelCallLogService;
     private final AiObservabilityMetrics observabilityMetrics;
+    private final double minimumRelevanceScore;
 
     public RagServiceImpl(
             RetrievalService retrievalService,
             AiRagGenerateClient aiRagGenerateClient,
             ModelCallLogService modelCallLogService,
-            AiObservabilityMetrics observabilityMetrics
+            AiObservabilityMetrics observabilityMetrics,
+            @Value("${app.rag.minimum-relevance-score:-1}") double minimumRelevanceScore
     ) {
         this.retrievalService = retrievalService;
         this.aiRagGenerateClient = aiRagGenerateClient;
         this.modelCallLogService = modelCallLogService;
         this.observabilityMetrics = observabilityMetrics;
+        this.minimumRelevanceScore = minimumRelevanceScore;
     }
 
     @Override
@@ -59,6 +72,7 @@ public class RagServiceImpl implements RagService {
         long generationStartedNanos = -1L;
         long generationNanos = -1L;
         boolean generationAttempted = false;
+        AiRagGenerateResponse generateResponse = null;
 
         try {
             String question = request.question().trim();
@@ -73,7 +87,6 @@ public class RagServiceImpl implements RagService {
             List<RetrievalSearchItem> chunks = retrievalResponse.records() == null
                     ? List.of()
                     : retrievalResponse.records();
-            List<RagCitation> citations = toCitations(chunks);
             if (chunks.isEmpty()) {
                 recordRagOutcome(
                         "no_context",
@@ -85,11 +98,21 @@ public class RagServiceImpl implements RagService {
                         0,
                         null
                 );
-                return noContextResponse(question, topK, retrievalResponse, citations, chunks);
+                return noAnswerResponse(
+                        question,
+                        topK,
+                        retrievalResponse,
+                        chunks,
+                        NO_CONTEXT,
+                        NO_RETRIEVED_CONTEXT,
+                        NO_CONTEXT_ANSWER
+                );
             }
 
-            List<AiRagContextChunk> contexts = toAiContexts(chunks);
-            if (contexts.isEmpty()) {
+            List<RetrievalSearchItem> usableChunks = chunks.stream()
+                    .filter(item -> StringUtils.hasText(item.text()))
+                    .toList();
+            if (usableChunks.isEmpty()) {
                 recordRagOutcome(
                         "no_context",
                         totalStartedNanos,
@@ -97,28 +120,59 @@ public class RagServiceImpl implements RagService {
                         -1L,
                         currentUserId,
                         knowledgeBaseId,
-                        contexts.size(),
+                        0,
                         null
                 );
-                return noContextResponse(question, topK, retrievalResponse, citations, chunks);
+                return noAnswerResponse(
+                        question,
+                        topK,
+                        retrievalResponse,
+                        chunks,
+                        NO_CONTEXT,
+                        NO_USABLE_CONTEXT,
+                        NO_CONTEXT_ANSWER
+                );
             }
 
+            List<RetrievalSearchItem> generationChunks = filterByMinimumRelevance(usableChunks);
+            if (generationChunks.isEmpty()) {
+                recordRagOutcome(
+                        "insufficient_context",
+                        totalStartedNanos,
+                        retrievalNanos,
+                        -1L,
+                        currentUserId,
+                        knowledgeBaseId,
+                        0,
+                        null
+                );
+                return noAnswerResponse(
+                        question,
+                        topK,
+                        retrievalResponse,
+                        chunks,
+                        INSUFFICIENT_CONTEXT,
+                        LOW_RELEVANCE,
+                        LOW_RELEVANCE_ANSWER
+                );
+            }
+
+            List<AiRagContextChunk> contexts = toAiContexts(generationChunks);
             generationAttempted = true;
             generationStartedNanos = System.nanoTime();
-            AiRagGenerateResponse generateResponse = aiRagGenerateClient.generate(new AiRagGenerateRequest(
+            generateResponse = aiRagGenerateClient.generate(new AiRagGenerateRequest(
                     question,
                     contexts
             ));
             generationNanos = System.nanoTime() - generationStartedNanos;
 
-            String outcome = hasAnswer(generateResponse) ? "generated" : "failed";
-            if ("generated".equals(outcome)) {
-                recordSuccessfulChatCall(currentUserId, generateResponse, generationNanos);
-            } else {
-                recordFailedChatCall(currentUserId, generateResponse, generationNanos, "EMPTY_RESPONSE");
-            }
+            ValidatedGeneration generation = validateGenerationResponse(
+                    generateResponse,
+                    generationChunks
+            );
+            recordSuccessfulChatCall(currentUserId, generateResponse, generationNanos);
             recordRagOutcome(
-                    outcome,
+                    generation.outcome(),
                     totalStartedNanos,
                     retrievalNanos,
                     generationNanos,
@@ -129,13 +183,16 @@ public class RagServiceImpl implements RagService {
             );
             return new RagAskResponse(
                     question,
-                    answerOrFallback(generateResponse),
+                    generation.answer(),
+                    generation.answerStatus(),
+                    generation.noAnswer(),
+                    generation.noAnswerReason(),
                     topK,
-                    generateResponse == null ? null : generateResponse.llmProvider(),
-                    generateResponse == null ? null : generateResponse.llmModel(),
+                    generateResponse.llmProvider(),
+                    generateResponse.llmModel(),
                     retrievalResponse.vectorStore(),
                     retrievalResponse.vectorCollection(),
-                    citations,
+                    generation.citations(),
                     chunks
             );
         } catch (RuntimeException ex) {
@@ -148,7 +205,7 @@ public class RagServiceImpl implements RagService {
                         : System.nanoTime() - generationStartedNanos;
                 recordFailedChatCall(
                         currentUserId,
-                        null,
+                        generateResponse,
                         generationNanos,
                         ex.getClass().getSimpleName()
                 );
@@ -165,22 +222,27 @@ public class RagServiceImpl implements RagService {
         }
     }
 
-    private RagAskResponse noContextResponse(
+    private RagAskResponse noAnswerResponse(
             String question,
             Integer topK,
             RetrievalSearchResponse retrievalResponse,
-            List<RagCitation> citations,
-            List<RetrievalSearchItem> chunks
+            List<RetrievalSearchItem> chunks,
+            String answerStatus,
+            String noAnswerReason,
+            String answer
     ) {
         return new RagAskResponse(
                 question,
-                NO_CONTEXT_ANSWER,
+                answer,
+                answerStatus,
+                true,
+                noAnswerReason,
                 topK,
                 null,
                 null,
                 retrievalResponse.vectorStore(),
                 retrievalResponse.vectorCollection(),
-                citations,
+                List.of(),
                 chunks
         );
     }
@@ -323,9 +385,19 @@ public class RagServiceImpl implements RagService {
         }
     }
 
+    private List<RetrievalSearchItem> filterByMinimumRelevance(
+            List<RetrievalSearchItem> usableChunks
+    ) {
+        if (minimumRelevanceScore < 0) {
+            return usableChunks;
+        }
+        return usableChunks.stream()
+                .filter(item -> item.score() != null && item.score() >= minimumRelevanceScore)
+                .toList();
+    }
+
     private List<AiRagContextChunk> toAiContexts(List<RetrievalSearchItem> chunks) {
         return chunks.stream()
-                .filter(item -> StringUtils.hasText(item.text()))
                 .map(item -> new AiRagContextChunk(
                         item.docId(),
                         item.chunkId(),
@@ -338,21 +410,80 @@ public class RagServiceImpl implements RagService {
                 .toList();
     }
 
-    private List<RagCitation> toCitations(List<RetrievalSearchItem> chunks) {
-        return IntStream.range(0, chunks.size())
-                .mapToObj(index -> RagCitation.from(index + 1, chunks.get(index)))
+    private ValidatedGeneration validateGenerationResponse(
+            AiRagGenerateResponse response,
+            List<RetrievalSearchItem> generationChunks
+    ) {
+        if (response == null
+                || !StringUtils.hasText(response.answer())
+                || !StringUtils.hasText(response.answerStatus())
+                || response.citedContextIndexes() == null) {
+            throw invalidGenerationResponse();
+        }
+
+        if (ANSWERED.equals(response.answerStatus())) {
+            if (StringUtils.hasText(response.noAnswerReason())) {
+                throw invalidGenerationResponse();
+            }
+            List<RagCitation> citations = citedChunks(
+                    response.citedContextIndexes(),
+                    generationChunks
+            );
+            if (citations.isEmpty()) {
+                throw invalidGenerationResponse();
+            }
+            return new ValidatedGeneration(
+                    response.answer().trim(),
+                    ANSWERED,
+                    false,
+                    null,
+                    "answered",
+                    citations
+            );
+        }
+
+        if (INSUFFICIENT_CONTEXT.equals(response.answerStatus())) {
+            if (!response.citedContextIndexes().isEmpty()
+                    || !StringUtils.hasText(response.noAnswerReason())) {
+                throw invalidGenerationResponse();
+            }
+            return new ValidatedGeneration(
+                    response.answer().trim(),
+                    INSUFFICIENT_CONTEXT,
+                    true,
+                    response.noAnswerReason().trim(),
+                    "insufficient_context",
+                    List.of()
+            );
+        }
+
+        throw invalidGenerationResponse();
+    }
+
+    private List<RagCitation> citedChunks(
+            List<Integer> citedContextIndexes,
+            List<RetrievalSearchItem> generationChunks
+    ) {
+        Set<Integer> uniqueIndexes = new LinkedHashSet<>(citedContextIndexes);
+        if (uniqueIndexes.contains(null)) {
+            throw invalidGenerationResponse();
+        }
+
+        return uniqueIndexes.stream()
+                .map(index -> {
+                    if (index < 1 || index > generationChunks.size()) {
+                        throw invalidGenerationResponse();
+                    }
+                    return RagCitation.from(index, generationChunks.get(index - 1));
+                })
                 .toList();
     }
 
-    private String answerOrFallback(AiRagGenerateResponse generateResponse) {
-        if (!hasAnswer(generateResponse)) {
-            return "LLM 未返回可用答案。";
-        }
-        return Objects.requireNonNull(generateResponse.answer()).trim();
-    }
-
-    private boolean hasAnswer(AiRagGenerateResponse response) {
-        return response != null && StringUtils.hasText(response.answer());
+    private BusinessException invalidGenerationResponse() {
+        return new BusinessException(
+                ErrorCode.AI_SERVICE_UNAVAILABLE,
+                "AI service returned an invalid RAG generation response"
+        );
     }
 
     private int nonNegative(Integer value) {
@@ -361,5 +492,15 @@ public class RagServiceImpl implements RagService {
 
     private long nanosToMillis(long durationNanos) {
         return Math.max(0L, durationNanos) / 1_000_000L;
+    }
+
+    private record ValidatedGeneration(
+            String answer,
+            String answerStatus,
+            Boolean noAnswer,
+            String noAnswerReason,
+            String outcome,
+            List<RagCitation> citations
+    ) {
     }
 }

@@ -513,6 +513,8 @@
     const kb = getSelectedKb();
     const response = state.rag.result;
     const citations = response?.citations || [];
+    const answerStatus = response ? formatRagAnswerStatus(response.answerStatus) : "";
+    const noAnswerReason = response ? formatRagNoAnswerReason(response.noAnswerReason) : "";
     return `
       ${renderKbHeader(kb, "rag")}
       <section class="query-grid">
@@ -544,7 +546,7 @@
               <p class="section-kicker">Answer</p>
               <h2>答案与引用</h2>
             </div>
-            ${response ? `<span class="status-pill blue">${citations.length} 引用</span>` : ""}
+            ${response ? `<span class="status-pill ${response.noAnswer ? "amber" : "blue"}">${escapeHtml(answerStatus)} · ${citations.length} 引用</span>` : ""}
           </div>
           ${isBusy("rag") ? renderLoading("正在同步生成答案") : ""}
           ${!response && !isBusy("rag") ? renderEmpty("暂无答案", "提交问题后返回 answer 和 citations。") : ""}
@@ -554,10 +556,11 @@
                 <span>${escapeHtml(response.llmProvider || "no-llm")}</span>
                 <span>${escapeHtml(response.llmModel || "no-model")}</span>
                 <span>${escapeHtml(response.vectorCollection || "-")}</span>
+                ${noAnswerReason ? `<span>${escapeHtml(noAnswerReason)}</span>` : ""}
               </div>
               <p>${escapeHtml(response.answer || "未返回答案。")}</p>
             </article>
-            ${citations.length === 0 ? renderEmpty("没有引用片段", "空知识库或无可用 chunk 时会出现该结果。") : ""}
+            ${citations.length === 0 ? renderEmpty("没有实际引用", "拒答结果不会把全部检索命中伪装成引用。") : ""}
             <div class="result-list">
               ${citations.map(renderCitationCard).join("")}
             </div>
@@ -565,6 +568,21 @@
         </div>
       </section>
     `;
+  }
+
+  function formatRagAnswerStatus(answerStatus) {
+    if (answerStatus === "ANSWERED") return "已回答";
+    if (answerStatus === "NO_CONTEXT") return "无可用上下文";
+    if (answerStatus === "INSUFFICIENT_CONTEXT") return "上下文不足";
+    return answerStatus || "未知状态";
+  }
+
+  function formatRagNoAnswerReason(reason) {
+    if (reason === "NO_RETRIEVED_CONTEXT") return "没有检索候选";
+    if (reason === "NO_USABLE_CONTEXT") return "候选正文不可用";
+    if (reason === "LOW_RELEVANCE") return "候选相关性不足";
+    if (reason === "MODEL_REPORTED_INSUFFICIENT_CONTEXT") return "模型判断上下文不足";
+    return reason || "";
   }
 
   function renderKbHeader(kb, active) {

@@ -78,9 +78,13 @@ app:
       ttl-seconds: ${KB_ACCESS_CACHE_TTL_SECONDS:300}
       ttl-jitter-seconds: ${KB_ACCESS_CACHE_TTL_JITTER_SECONDS:60}
   ai-service:
-    base-url: http://localhost:8000
+    base-url: ${AI_SERVICE_BASE_URL:http://localhost:8000}
     connect-timeout-ms: ${AI_SERVICE_CONNECT_TIMEOUT_MS:2000}
     response-timeout-seconds: ${AI_SERVICE_RESPONSE_TIMEOUT_SECONDS:180}
+  rag:
+    # 历史 baseline 中可回答与 no-answer 的向量分数存在重叠，默认禁用阈值。
+    # 设置为 0 到 1 之间的值后，只有达到阈值的 chunk 才会传给生成服务。
+    minimum-relevance-score: ${RAG_MINIMUM_RELEVANCE_SCORE:-1}
   storage:
     minio:
       endpoint: ${MINIO_ENDPOINT:http://localhost:9000}

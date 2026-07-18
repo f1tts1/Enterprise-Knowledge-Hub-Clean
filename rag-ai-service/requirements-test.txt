@@ -1,0 +1,9 @@
+# CI 只安装核心单元测试需要的依赖，避免下载 sentence-transformers、PyTorch 和模型权重。
+fastapi>=0.115.0
+pydantic-settings>=2.6.0
+httpx>=0.27.0
+minio>=7.2.0
+qdrant-client>=1.12.0
+python-dotenv>=1.0.0
+pymupdf>=1.24.0
+python-docx>=1.1.0

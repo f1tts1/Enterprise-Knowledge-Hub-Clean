@@ -1,0 +1,15 @@
+Alice RAG 评测方案说明文档。
+
+Enterprise Knowledge Hub 的 RAG 评测不是为了追求论文级规模，而是为了证明个人项目中的检索和生成链路可以被重复验证。第一版评测集建议控制在 30 到 100 条问题之间，当前 baseline 使用 50 条左右问题会更稳。问题类型至少覆盖单段事实型、多段信息组合型、表述改写型、无答案型和权限隔离型。
+
+每条评测数据至少记录 question、expected_answer、expected_doc_key、expected_chunk_index 或 evidence_terms、allowed_user、kb_key、question_type。由于真实 docId 会在上传后才生成，评测脚本先用 doc key 描述期望证据，运行时再映射成数据库里的真实 document id。
+
+检索指标第一阶段只使用 Recall@K、MRR 和 Evidence Hit Rate。Recall@K 判断 topK 结果中是否包含期望文档或期望证据，MRR 判断第一个相关结果排在第几位，Evidence Hit Rate 判断命中文本是否包含关键证据词。nDCG 暂时不实现，因为当前数据集还没有多级相关性标注。
+
+生成指标采用轻量规则和人工复盘结合。脚本会检查答案是否包含 answer_terms，citations 是否来自期望文档，无答案题是否出现“不足、无法、没有”等拒答表达，权限题是否出现 forbidden_terms。聚合指标不能替代人工判断，bad_cases.md 用于复盘失败原因。
+
+每次实验需要保存 run_config.json、results.jsonl、summary.json 和 bad_cases.md。run_config 记录 base_url、topK、是否 retrieval-only、上传后的 docId 和知识库 id。results.jsonl 记录每条问题的检索结果、引用、答案和失败原因。summary.json 记录聚合指标。bad_cases.md 记录可读的失败样例。
+
+第一轮只建立 dense retrieval baseline，不直接实现 hybrid、rerank 或 query rewrite。只有当 bad case 显示专有名词、编号或短关键词无法召回时，才考虑 hybrid search。只有当 Recall@K 较好但 MRR 较差时，才考虑 rerank。query rewrite 放在最后，因为它依赖 LLM，容易引入额外不确定性。
+
+最有价值的对照实验是 chunk size、chunk overlap、topK 和相似度阈值。chunk 参数影响证据是否被切散，topK 影响上下文召回数量，相似度阈值影响无答案判断。不要一次组合太多变量，否则个人项目很难解释结果。

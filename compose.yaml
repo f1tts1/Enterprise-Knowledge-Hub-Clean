@@ -1,0 +1,190 @@
+name: enterprise-knowledge-hub
+
+services:
+  mysql:
+    image: mysql:8.4.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?copy .env.example to .env and set MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: enterprise_knowledge_hub
+      MYSQL_USER: ${DB_USERNAME:-ekb}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?copy .env.example to .env and set DB_PASSWORD}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+08:00
+    ports:
+      - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # V1 会删除并重建数据库，只允许 MySQL 空卷首次初始化时执行。
+      - ./enterprise-rag-backend/src/main/resources/db/migration/V1__init_schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysqladmin ping -h 127.0.0.1 -uroot --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  redis:
+    image: redis:7.4.2-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?copy .env.example to .env and set REDIS_PASSWORD}
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:?copy .env.example to .env and set REDIS_PASSWORD}
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:4.0.5-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME:-ekb}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?copy .env.example to .env and set RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VIRTUAL_HOST:-/}
+    ports:
+      - "127.0.0.1:${RABBITMQ_PORT:-5672}:5672"
+      - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?copy .env.example to .env and set MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?copy .env.example to .env and set MINIO_SECRET_KEY}
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.4
+    ports:
+      - "127.0.0.1:${QDRANT_PORT:-6333}:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+  model-init:
+    image: enterprise-knowledge-hub/rag-ai-service:local
+    build:
+      context: .
+      dockerfile: rag-ai-service/Dockerfile
+    environment:
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        if test -f /models/bge-small-zh-v1.5/config.json
+        && (test -f /models/bge-small-zh-v1.5/model.safetensors
+        || test -f /models/bge-small-zh-v1.5/pytorch_model.bin);
+        then echo 'embedding model already initialized';
+        else python /opt/ekb/scripts/download_embedding_model.py
+        --local-dir /models/bge-small-zh-v1.5; fi
+    volumes:
+      - embedding-model:/models
+    restart: "no"
+
+  rag-ai-service:
+    image: enterprise-knowledge-hub/rag-ai-service:local
+    build:
+      context: .
+      dockerfile: rag-ai-service/Dockerfile
+    environment:
+      APP_NAME: rag-ai-service
+      APP_ENV: compose
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?copy .env.example to .env and set MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?copy .env.example to .env and set MINIO_SECRET_KEY}
+      MINIO_SECURE: "false"
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-rag_chunks_v1}
+      EMBEDDING_PROVIDER: local
+      EMBEDDING_MODEL_PATH: /models/bge-small-zh-v1.5
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-BAAI/bge-small-zh-v1.5}
+      EMBEDDING_DEVICE: ${EMBEDDING_DEVICE:-cpu}
+      EMBEDDING_NORMALIZE: "true"
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
+      LLM_PROVIDER: ${LLM_PROVIDER:-none}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    ports:
+      # FastAPI 尚无内部 token，只允许宿主本机调试，不能暴露到局域网。
+      - "127.0.0.1:${AI_SERVICE_PORT:-8000}:8000"
+    volumes:
+      - embedding-model:/models:ro
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_started
+      qdrant:
+        condition: service_started
+
+  enterprise-rag-backend:
+    image: enterprise-knowledge-hub/backend:local
+    build:
+      context: .
+      dockerfile: enterprise-rag-backend/Dockerfile
+    environment:
+      DB_URL: jdbc:mysql://mysql:3306/enterprise_knowledge_hub?useUnicode=true&characterEncoding=utf8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai
+      DB_USERNAME: ${DB_USERNAME:-ekb}
+      DB_PASSWORD: ${DB_PASSWORD:?copy .env.example to .env and set DB_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?copy .env.example to .env and set REDIS_PASSWORD}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USERNAME: ${RABBITMQ_USERNAME:-ekb}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?copy .env.example to .env and set RABBITMQ_PASSWORD}
+      RABBITMQ_VIRTUAL_HOST: ${RABBITMQ_VIRTUAL_HOST:-/}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?copy .env.example to .env and set MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?copy .env.example to .env and set MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET:-ekb-documents}
+      AI_SERVICE_BASE_URL: http://rag-ai-service:8000
+      AI_SERVICE_CONNECT_TIMEOUT_MS: ${AI_SERVICE_CONNECT_TIMEOUT_MS:-2000}
+      AI_SERVICE_RESPONSE_TIMEOUT_SECONDS: ${AI_SERVICE_RESPONSE_TIMEOUT_SECONDS:-180}
+      RAG_MINIMUM_RELEVANCE_SCORE: ${RAG_MINIMUM_RELEVANCE_SCORE:--1}
+      JWT_SECRET: ${JWT_SECRET:?copy .env.example to .env and set JWT_SECRET}
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8080}:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      rag-ai-service:
+        condition: service_started
+
+volumes:
+  mysql-data:
+  redis-data:
+  rabbitmq-data:
+  minio-data:
+  qdrant-data:
+  embedding-model:
