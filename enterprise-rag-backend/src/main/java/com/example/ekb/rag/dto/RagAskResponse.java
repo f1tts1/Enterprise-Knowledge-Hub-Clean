@@ -7,6 +7,9 @@ import com.example.ekb.retrieval.dto.RetrievalSearchItem;
 public record RagAskResponse(
         String question,
         String answer,
+        String answerStatus,
+        Boolean noAnswer,
+        String noAnswerReason,
         Integer topK,
         String llmProvider,
         String llmModel,

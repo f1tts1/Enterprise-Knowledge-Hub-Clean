@@ -1,301 +1,194 @@
 # AGENTS.md
 
-本文件用于约束本仓库后续开发。任何自动化代理或协作者在修改代码前，都应该先阅读本文件，并以当前已落地实现为准。
+本文件约束本仓库后续开发。任何自动化代理或协作者在修改代码前都必须阅读，并以当前已落地实现为准。
 
 ## 项目定位
 
-Enterprise Knowledge Hub 是一个面向 Java 后端 / AI 工程化求职展示的企业知识库项目。
-
-当前目标不是做 LangChain Demo，而是做一个真实后端工程闭环：
+Enterprise Knowledge Hub 是一个面向 Java 后端 / AI 工程化求职展示的企业知识库项目，目标是做真实工程闭环，而不是堆叠框架：
 
 - Spring Boot 负责业务系统、鉴权、权限边界、文档元数据、任务状态和服务编排。
-- FastAPI 负责文档解析、文本切分、本地 embedding、Qdrant 写入和知识库内向量检索。
-- RabbitMQ 承担文档上传后到索引处理之间的异步任务队列。
-- Redis 承担认证用户快照缓存、Refresh Token 会话和知识库访问缓存。
-- MinIO 存储上传文件。
-- MySQL 保存用户、知识库、文档、索引任务等业务数据。
-- Qdrant 保存 chunk 向量和检索所需 payload。
+- FastAPI 负责文档解析、文本切分、本地 embedding、Qdrant 访问和受控 RAG 生成。
+- RabbitMQ 承担上传到索引处理的异步任务队列。
+- Redis 承担认证用户快照、Refresh Token 会话和知识库访问缓存。
+- MinIO 保存原文件，MySQL 保存业务事实，Qdrant 保存 chunk vector 与检索 payload。
 
-当前已经落地到“上传文档 -> 异步解析索引 -> 写入 Qdrant -> 按用户和知识库过滤检索 chunk -> Java 编排最小同步 RAG 问答 -> 删除文档时清理 Qdrant vectors”。当前 RAG 只做同步问答和引用片段返回，不实现 SSE 流式输出、会话引用落库、复杂 no-answer 判断、正式 RAG 评测系统、rerank 或 Agent 工作流；仓库中的固定问题集只作为轻量回归基线。
+当前链路已经落地为：上传 -> 异步索引 -> Qdrant -> 权限过滤检索 -> Java 编排同步 RAG -> 结构化拒答/实际引用 -> 删除向量。当前不实现 SSE、多轮会话落库、hybrid/rerank/query rewrite、正式 RAG 评测平台或 Agent；固定问题集只作为轻量回归基线。
 
 ## 技术栈
 
-- Java：Java 17 + Spring Boot 3.3.5
-- Java ORM：MyBatis-Plus 3.5.9
-- Java 安全：Spring Security + JWT + BCrypt
-- Java HTTP 客户端：Spring WebClient / Reactor Netty
-- Java 可观测性：Spring Boot Actuator + Micrometer + Prometheus registry
-- Python：Python 3.11+ + FastAPI
-- Python 文档解析：PyMuPDF、python-docx、自定义 TXT/Markdown loader
-- Python embedding：sentence-transformers + 本地 `BAAI/bge-small-zh-v1.5`
-- 数据库：MySQL 8.0+ / 9.x
-- 异步队列：RabbitMQ
-- 缓存 / 登录会话：Redis
-- 对象存储：MinIO
-- 向量库：Qdrant
+- Java 17、Spring Boot 3.3.5、MyBatis-Plus 3.5.9。
+- Spring Security、JWT、BCrypt、WebClient/Reactor Netty。
+- Actuator、Micrometer、Prometheus registry。
+- Python 3.11+、FastAPI、PyMuPDF、python-docx。
+- sentence-transformers、本地 `BAAI/bge-small-zh-v1.5`。
+- MySQL、Redis、RabbitMQ、MinIO、Qdrant。
 
 ## 目录职责
 
 ```text
-enterprise-rag-backend/
-  src/main/java/com/example/ekb/
-    auth/        用户注册、登录、JWT 签发
-    user/        当前用户信息
-    knowledge/   个人知识库 CRUD
-    document/    文档上传、文档列表、文档详情、索引状态、状态驱动删除
-    indexing/    不可变索引 attempt、current task fencing、RabbitMQ 生产和消费
-    retrieval/   知识库内向量检索入口，负责 Java 层权限校验
-    rag/         最小同步 RAG 问答入口，复用检索并调用 Python 生成
-    ai/          Java 调 Python AI 服务的 HTTP client 和 DTO
-    storage/     MinIO 存储抽象与实现
-    security/    JWT 认证过滤器和 token provider
-    common/      统一响应、错误码、异常处理、requestId
-    config/      Spring Security、WebClient、MinIO 配置
-    observability/ requestId 下游传播、低基数指标和 model_call_log 旁路写入
-  src/main/resources/
-    application.yml
-    db/migration/V1__init_schema.sql
-    static/console/  Spring Boot 同源提供的前端应用
+enterprise-rag-backend/src/main/java/com/example/ekb/
+  auth/          注册、登录、JWT
+  user/          当前用户
+  knowledge/     个人知识库 CRUD
+  document/      上传、查询、状态驱动删除
+  indexing/      不可变 attempt、current-task fencing、RabbitMQ
+  retrieval/     Java 权限校验、Python 检索、MySQL 二次过滤
+  rag/           最小同步 RAG 编排与对外状态
+  ai/            Java 调 FastAPI 的 HTTP client / DTO
+  storage/       MinIO 抽象
+  security/      JWT 认证
+  common/        统一响应、错误码、requestId
+  observability/ requestId、低基数指标、model_call_log
 
-rag-ai-service/
-  app/
-    main.py              FastAPI 应用入口
-    api/v1/documents.py  文档索引内部 API
-    api/v1/retrieval.py  向量检索内部 API
-    api/v1/rag.py        RAG 生成内部 API
-    clients/             MinIO 读取客户端、Qdrant 写入/检索/删除客户端
-    config/              环境变量配置
-    document_loader/     PDF、Word、TXT、Markdown 解析
-    splitter/            文本切分与 chunk 元数据
-    embedding/           本地 embedding provider
-    indexing/            文档索引 pipeline：解析、切分、embedding、写入 Qdrant
-    retrieval/           query embedding + Qdrant filter 检索
-    generator/           OpenAI-compatible Chat Completions 答案生成
-    observability/       requestId 上下文、中间件和日志配置
-    schemas/             Python API DTO
+rag-ai-service/app/
+  api/v1/        索引、检索、生成内部 API
+  clients/       MinIO / Qdrant
+  document_loader/ splitter/ embedding/
+  indexing/ retrieval/ generator/
+  observability/ schemas/
 
-docs/
-  ARCHITECTURE.md
-  STATUS.md
-  DECISIONS.md
-  API_CONTRACT.md
-  OBSERVABILITY.md
-  V1已实现功能测试用例.md
-
-scripts/
-  download_embedding_model.py
-  fixtures/retrieval-permission/  权限回归固定文档，不依赖被忽略的 tmp 目录
-  reliability_test_lib.sh         可靠性脚本共享的 API/状态/只读 SQL 断言
-  test_rabbitmq_reliability.sh    RabbitMQ 停机重投、重复消息、DLQ 演练
-  test_document_delete_failure_recovery.sh  Qdrant/MinIO 删除失败恢复演练
-  test_retrieval_permission.sh
-  test_document_reupload_delete.sh
-  test_rag_ask.sh
-  test_rag_empty_kb.sh
-  test_rag_permission.sh
+contracts/ai/    Java/Python 共用 DTO fixture
+eval/rag/        固定轻量回归资产；results 被忽略
+docs/            架构、契约、测试、部署与证据
+scripts/         统一验证、回归与故障演练
 ```
 
 ## 编码规范
 
-- Java 业务服务使用接口 + `impl` 实现类，例如 `DocumentService` + `DocumentServiceImpl`。
-- Java Controller 只做参数接收和响应封装，业务逻辑放在 Service。
-- Java 对前端响应统一使用 `ApiResponse<T>`。
-- Java 分页响应统一使用 `PageResponse<T>`。
-- Java 错误码统一维护在 `ErrorCode`。
-- Java 跨模块共享的业务状态常量统一维护在 `common/constants`，例如文档索引状态和索引任务状态；局部配置、限制值和错误文案不强行集中。
-- Java 和 Python 通信必须通过 HTTP DTO，不允许 Java 直接执行 Python 脚本。
-- Python API DTO 使用 Pydantic model。
-- Python 的文档索引 pipeline 保持清晰步骤：下载文件、解析、切分、embedding、写入 Qdrant。
-- Python 的检索 pipeline 保持清晰步骤：query embedding、Qdrant filter、返回 chunk 命中。
-- 注释使用中文，重点解释工程原因、边界和风险，不给每行语法写空泛注释。
-- 不要保留只有 docstring 的占位文件。文件存在就应该有真实职责。
-- 修改接口、状态字段、错误码、异步流程、权限边界或向量库 schema 时，必须同步更新 `docs/API_CONTRACT.md`、`docs/STATUS.md` 和必要的 README。
-- 可观测性是旁路：指标或 `model_call_log` 写入失败不得把已经成功的索引、检索或 RAG 主链路改写为失败。
-- Micrometer 标签只能使用固定的 application 和 operation、outcome、failure_stage、phase、type 等有限枚举；禁止把 requestId、userId、kbId、documentId、taskId、模型正文或错误全文放进指标标签。
-- 日志和模型调用记录不得保存 API Key、Authorization、完整 prompt、问题、chunk 或答案正文；错误信息必须做脱敏和长度限制。
+- Java 业务服务使用接口 + `impl`，Controller 只收参和封装响应，业务放 Service。
+- 对外响应统一使用 `ApiResponse<T>`；分页统一使用 `PageResponse<T>`；错误码维护在 `ErrorCode`。
+- 跨模块业务状态常量放 `common/constants`；不要为局部值制造全局常量层。
+- Java 与 Python 只通过 HTTP DTO 通信，Java 不执行 Python 脚本或本地进程。
+- Python DTO 使用 Pydantic；索引 pipeline 保持“下载、解析、切分、embedding、写 Qdrant”的显式步骤。
+- 注释使用中文，解释工程原因、边界和风险；禁止空文件、空类、只有 docstring 的占位实现。
+- 修改接口、状态、错误码、权限、异步流程、向量 schema 或 Compose 环境变量时，同步更新 `docs/API_CONTRACT.md`、`docs/STATUS.md` 和必要 README。
+- 可观测性是旁路：指标和 `model_call_log` 失败不能改写成功主链路。
+- Micrometer 标签只使用有限枚举；禁止 requestId、userId、kbId、documentId、taskId、正文或错误全文进入标签。
+- 日志和模型调用记录不得保存 API Key、Authorization、完整 prompt、问题、chunk 或答案正文；错误需脱敏和截断。
 
 ## 架构约束
 
-- Spring Boot 是业务系统主体；FastAPI 只处理 AI 能力和向量库访问细节。
-- 用户权限、知识库归属、文档归属必须在 Java 层校验。
-- Python 不负责完整用户权限判断，只接收 Java 已校验后的最小任务 DTO。
-- 检索时 Java 必须先校验当前用户拥有知识库；Python 必须把 `ownerUserId + kbId` 下推到 Qdrant filter。
-- 上传文档后不能同步调用 Python；必须通过 RabbitMQ 形成异步边界。
-- RabbitMQ 消息只保存 `documentId` 和 `indexingTaskId`，消费者重新查 MySQL。
-- 消费者必须校验 task/document 的 `documentId + kbId + ownerUserId` 关联；非 current 的合法历史消息跳过，静态关联错误进入 DLQ。
-- 文件内容必须通过 MinIO 传递，Java 不把文件字节直接转发给 Python。
-- 当前索引状态由 MySQL 中 `document` 和 `indexing_task` 维护。
-- `indexing_task` 每个 attempt 单向流转；FAILED 业务重试必须新建 task，禁止把 FAILED task 重置为 PENDING。只有 PENDING 传输恢复允许重投同一 task。
-- `document.current_indexing_task_id` 是索引 document 状态更新的 fencing token，task 成功、失败和 timeout 都必须匹配 current task。
-- PENDING 发布重试必须通过 `last_publish_attempt_at` 做原子 claim 和时间节流；`max_retry` 必须实际生效。
-- 当前 `document.index_status` 只使用 `PENDING_INDEX`、`INDEXING`、`INDEXED`、`INDEX_FAILED`、`DELETING`、`DELETED`、`DELETE_FAILED`，不保留当前流程不会写入的预留状态。
-- Python 写 Qdrant 成功后只通过 DTO 汇报统计，不直接修改 MySQL。
-- 删除文档时 Java 负责业务状态流转，Python 只按 Java 传入的 `ownerUserId + kbId + docId` 清理 Qdrant vectors。
-- 删除成功、失败和超时必须匹配本次 `delete_generation`；旧删除调用不得覆盖新重试。
-- 当前同时提供向量检索接口和最小同步 RAG 问答接口；不得把 `retrieval/search` 单独描述成 RAG 问答能力。
-- RAG 问答必须复用 Java 检索服务完成知识库 owner 校验、Qdrant filter 检索和 MySQL 二次过滤后，再把 chunk context 传给 Python 生成。
-- Python RAG 生成接口只消费 Java 已过滤的上下文，不访问 MySQL，不自行判断完整用户权限。
-- 同步 Java API 采用入口 `X-Request-Id` 关联 Java、Python 和 LLM 调用；非法或缺失值由服务生成安全 UUID。异步索引不沿用上传请求 ID，而是使用稳定的 `index-task-{indexingTaskId}`，RabbitMQ 消息体仍只包含两个业务 ID。
-- Python 索引、检索和生成响应中的阶段耗时/usage 只作为可观测字段，不参与权限或业务状态判断；当前非流式 LLM 耗时是完整调用耗时，禁止描述成首 token 延迟。
-- `/actuator/prometheus` 继续受现有 Spring Security JWT 保护；不得为了抓取方便匿名放行，也不得恢复 health 接口作为演示入口。
-- 当前不提供 `/health` 或 `/api/v1/health` 接口，连通性用真实业务接口验证。
+### 业务与 AI 边界
 
-## 构建、启动和测试命令
+- Spring Boot 是业务主体；FastAPI 不成为第二套用户/知识库业务后端。
+- 用户、知识库和文档归属必须由 Java 校验；Python 只接收 Java 已校验的最小 DTO。
+- 检索先由 Java 校验 owner，Python 必须把 `ownerUserId + kbId` 下推到 Qdrant filter，Java 再按 MySQL 当前状态二次过滤。
+- 文件通过 MinIO 传递，Java 不把文件字节同步转发给 Python。
 
-### MySQL 初始化
+### 异步索引
+
+- 上传后不得同步调用 Python，必须经 RabbitMQ。
+- RabbitMQ 消息只包含 `documentId` 和 `indexingTaskId`，消费者重新查询 MySQL。
+- 消费者校验 task/document 的 `documentId + kbId + ownerUserId`；合法历史消息跳过，静态关联错误进入 DLQ。
+- 每个 `indexing_task` attempt 单向流转；FAILED 业务重试新建 task，禁止重置为 PENDING。
+- 只有 PENDING 传输恢复可重投同一 task；`last_publish_attempt_at` 必须原子 claim 和节流，`max_retry` 必须生效。
+- `document.current_indexing_task_id` 是 fencing token；成功、失败、timeout 都必须匹配 current task。
+- 文档索引状态仅使用 `PENDING_INDEX`、`INDEXING`、`INDEXED`、`INDEX_FAILED`、`DELETING`、`DELETED`、`DELETE_FAILED`。
+- Python 写 Qdrant 后只回报 DTO，不修改 MySQL。
+
+### 删除一致性
+
+- Java 驱动删除状态，Python 仅按 `ownerUserId + kbId + docId` 删除 Qdrant points。
+- 成功、失败、timeout 都必须匹配本次 `delete_generation`；旧调用不能覆盖新重试。
+- Qdrant/MinIO 不参与 MySQL 分布式事务，失败进入可见状态并允许受控重试，不伪装强一致。
+
+### RAG 协议
+
+- `/retrieval/search` 是独立向量检索，不得描述成完整 RAG。
+- RAG 必须复用 Java 检索服务的 owner 校验、Qdrant filter 与 MySQL 二次过滤，再将上下文发给 Python。
+- Python 生成只消费已过滤上下文，不访问 MySQL，也不执行完整用户权限判断。
+- 对外状态只使用：
+  - `ANSWERED`：至少一个合法实际引用。
+  - `NO_CONTEXT`：Java 无候选/无正文短路，不调用 LLM。
+  - `INSUFFICIENT_CONTEXT`：阈值过滤为空或模型按 sentinel 拒答。
+- Python 只把完整 `__EKB_NO_ANSWER__` 解析成拒答；与其它文本混用、无引用回答、越界引用都视为 provider 协议错误。
+- `citations` 仅包含答案实际出现的去重 `[片段 n]`；`retrievedChunks` 是候选结果，两者不得混称。
+- `RAG_MINIMUM_RELEVANCE_SCORE` 默认 `-1` 禁用。历史 fixed baseline 中正负样本分数重叠，未经重跑实验不得启用或宣传统一阈值效果。
+- `charStart`/`charEnd` 是 splitter 在页面文本规范化和 overlap 后生成的逻辑 span，0-based、end-exclusive；当前递归边界重组使它不保证是 loader 原文的严格切片，也不是文件字节偏移或 PDF 排版坐标。引用以 `pageNo + chunkIndex + text` 为主。
+
+### 关联与指标
+
+- 同步入口使用安全 `X-Request-Id` 关联 Java、Python、LLM；非法/缺失值生成 UUID。
+- 异步索引不沿用上传 ID，使用 `index-task-{indexingTaskId}`；消息体仍只有两个业务 ID。
+- Python 阶段耗时/usage 仅用于可观测性，不参与权限或状态判断。
+- RAG outcome 使用 `answered`、`no_context`、`insufficient_context`、`failed`。
+- 非流式 LLM 完整耗时不得称为 TTFT。
+- `/actuator/prometheus` 继续受 JWT 保护；不得匿名放行，也不得恢复 health 演示接口。
+
+## 构建、运行与测试
+
+命令默认从仓库根目录执行。
+
+确定性核心验证：
 
 ```bash
-cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub/enterprise-rag-backend"
-mysql -u root -p < src/main/resources/db/migration/V1__init_schema.sql
+python -m pip install -r rag-ai-service/requirements-test.txt
+./scripts/verify.sh
+docker compose --env-file .env.example config --quiet
 ```
 
-注意：当前 SQL 文件开头包含 `DROP DATABASE IF EXISTS enterprise_knowledge_hub;`，会删除本地已有数据。执行前必须确认这是本地测试库。
+`verify.sh` 不启动应用或外部依赖。完整证据分层见 `docs/TESTING.md`。
 
-数据库初始化路径互斥：全新/可重置库只执行 V1（已含最终结构），不能再执行 V3；已有旧库不要重跑 V1，应先停应用并备份，再按需执行缺失迁移。V3 是一次性非幂等 DDL，失败后恢复备份，不直接重跑：
-
-```bash
-cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub/enterprise-rag-backend"
-mysql -u root -p < src/main/resources/db/migration/V2__fix_document_active_checksum_index.sql
-mysql -u root -p < src/main/resources/db/migration/V3__add_indexing_attempt_and_deletion_fencing.sql
-```
-
-V3 会在 DDL 前校验旧实现“每个 document 至多一条 indexing_task”的不变量，异常数据必须人工确认后再迁移。
-
-### Java 编译
+Java 单独编译：
 
 ```bash
-cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub/enterprise-rag-backend"
+cd enterprise-rag-backend
 mvn -q -DskipTests -o compile
 ```
 
-如果需要联网拉依赖，去掉 `-o`。
-
-### Java 启动
+Python 语法检查：
 
 ```bash
-cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub/enterprise-rag-backend"
-cp src/main/resources/application-local.example.yml src/main/resources/application-local.yml
-# 编辑 application-local.yml 并替换凭证占位值
-SPRING_PROFILES_ACTIVE=local mvn spring-boot:run
+python3 -m compileall rag-ai-service/app scripts/download_embedding_model.py scripts/run_rag_eval.py
 ```
 
-Java 默认依赖：
-
-- MySQL：`localhost:3306`
-- Redis：`localhost:6379`，凭证通过本地配置提供
-- RabbitMQ：`localhost:5672`，凭证通过本地配置提供
-- MinIO：`http://localhost:9000`，凭证通过本地配置提供
-- FastAPI：`http://localhost:8000`
-- Qdrant：`http://localhost:6333`
-
-### Python 依赖
+Compose 本机演示：
 
 ```bash
-cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub"
-conda activate rag-ai-service
-python -m pip install -r rag-ai-service/requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-```
-
-### 下载本地 embedding 模型
-
-```bash
-cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub"
-conda activate rag-ai-service
-python scripts/download_embedding_model.py
-```
-
-如 HuggingFace 直连较慢，可使用：
-
-```bash
-HF_ENDPOINT=https://hf-mirror.com python scripts/download_embedding_model.py
-```
-
-### Python 启动
-
-```bash
-cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub/rag-ai-service"
-conda activate rag-ai-service
 cp .env.example .env
-# 编辑 .env 并替换 MinIO 凭证占位值
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+# 替换所有 secret 占位符
+docker compose up --build
 ```
 
-### Python 语法检查
+首次模型初始化依赖网络；宿主端口只绑定 `127.0.0.1`。`docker compose down -v` 会删除所有数据卷和模型卷。完整边界见 `docs/DEPLOYMENT.md`。
+
+非容器环境的数据库路径互斥：空/可重置库只执行 V1；旧库备份后按缺失版本执行 V2/V3。V1 会删除数据库，V3 非幂等，不能无确认重跑。
+
+本地完整环境测试：
 
 ```bash
-cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub"
-python3 -m compileall rag-ai-service/app scripts/download_embedding_model.py
-```
-
-### Qdrant 连通性
-
-```bash
-curl http://localhost:6333/collections
-```
-
-### 当前端到端权限检索测试
-
-```bash
-cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub"
 ./scripts/test_retrieval_permission.sh
-```
-
-脚本会创建 Alice/Bob 两个测试用户、两个知识库，上传不同 TXT 文档，等待索引完成，并验证不同用户只能检索自己的知识库内容，以及删除文档后不会再召回该文档 chunk。
-
-### 当前 RAG 验证脚本
-
-```bash
-cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub"
+./scripts/test_document_reupload_delete.sh
 ./scripts/test_rag_ask.sh
 ./scripts/test_rag_empty_kb.sh
 ./scripts/test_rag_permission.sh
+python3 scripts/run_rag_eval.py --retrieval-only
 ```
 
-这些脚本只验证当前已实现的同步 RAG：正常问答、空知识库不调用 LLM 的兜底响应，以及 Alice/Bob 之间的 RAG 权限隔离。运行 RAG 生成相关脚本前，需要让 FastAPI 进程能读取 `DEEPSEEK_API_KEY` 或显式 `LLM_*` 配置。
+生成脚本需要 FastAPI 已配置 LLM。故障演练命令和证据口径见 `docs/RELIABILITY_MATRIX.md`；脚本存在不等于外部演练通过。
 
-### 当前可靠性故障演练
+## 当前演示路径
 
-```bash
-cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub"
-
-# 先在当前本地会话安全设置 RABBITMQ_USERNAME / RABBITMQ_PASSWORD，
-# 不要把真实密码直接写进命令历史。
-MYSQL_DEFAULTS_FILE="$HOME/.my-ekb.cnf" ./scripts/test_rabbitmq_reliability.sh
-
-MYSQL_DEFAULTS_FILE="$HOME/.my-ekb.cnf" \
-./scripts/test_document_delete_failure_recovery.sh qdrant
-
-MYSQL_DEFAULTS_FILE="$HOME/.my-ekb.cnf" \
-./scripts/test_document_delete_failure_recovery.sh minio
-```
-
-这些脚本不会自行停止或启动服务，也不允许为演练增加生产 test-only API。操作者按提示切换本地依赖；脚本负责断言公开 API、固定只读 SQL、模型调用计数和 DLQ。脚本通过只代表“演练脚本已就绪”，只有真实执行并记录日期/环境/关键输出后才能写“外部演练已通过”。Mockito/MyBatis wrapper 测试不能描述成真实 MySQL 并发证据。
-
-### 当前可演示路径
-
-1. 启动 MySQL、Redis、MinIO、Qdrant、FastAPI、Spring Boot。
-2. 注册用户。
-3. 登录获取 JWT。
-4. 创建知识库。
-5. 上传 TXT/Markdown/PDF/DOCX 文档。
-6. 查询文档列表和索引状态，直到 `document.index_status=INDEXED`、`indexing_task.status=SUCCESS`。
-7. 调用 Java 检索接口查询当前知识库 chunk。
-8. 调用 Java RAG 问答接口，确认 answer、citations 和 retrievedChunks 基于当前用户知识库返回。
-9. 用不同用户互查知识库，确认返回 404 或检索不到对方内容。
-10. 删除文档，确认对应 Qdrant chunk 不再被检索返回。
+1. 注册并登录。
+2. 创建个人知识库。
+3. 上传 TXT/Markdown/PDF/DOCX。
+4. 观察 document/task 到 `INDEXED/SUCCESS`。
+5. 在 Java 检索入口查询 chunk。
+6. 调用同步 RAG，观察结构化状态、actual citations 和 candidate chunks。
+7. 使用另一用户验证知识库 404 / 无越权检索。
+8. 删除文档，确认不再召回对应 Qdrant chunk。
 
 ## 明确禁止事项
 
-- 禁止继续新增功能而不先更新状态文档。
-- 禁止恢复早期 health 接口作为演示入口。
-- 禁止把当前基础指标描述成已经具备 Grafana 看板、告警、长期指标存储或生产级监控。
-- 禁止把同步 LLM 完整耗时描述成 TTFT，也不得把 P0-2 的调用日志字段预留描述成正式 RAG 评测系统。
-- 禁止把未实现的 SSE、多轮会话落库、Agent、复杂 no-answer、rerank、正式评测平台写进“已完成”。
-- 禁止把当前 retrieval/search 接口描述成已经完成 RAG 问答。
-- 禁止把 Python 做成完整业务后端。
-- 禁止在 Java 中直接调用 Python 脚本或本地进程。
-- 禁止把本地模型目录 `.models/` 提交到 Git。
-- 禁止把 DeepSeek/OpenAI API Key、JWT_SECRET、MinIO 密钥写死提交。
-- 禁止绕过 Java 权限校验直接让 Python 按用户输入访问任意 bucket/object。
-- 禁止让 Qdrant 检索缺少 `ownerUserId + kbId` filter。
-- 禁止用未实现的空文件、空类、空接口伪装项目进度。
+- 禁止新增功能而不更新状态和契约文档。
+- 禁止恢复 health API，或为了演示/测试增加生产 test-only API。
+- 禁止把基础指标描述为 Grafana、告警、长期存储或生产级监控。
+- 禁止把完整 LLM 耗时描述成 TTFT，把调用日志字段描述成正式 RAG 评测系统。
+- 禁止把未实现的 SSE、多轮会话、Agent、hybrid、rerank、query rewrite 或正式评测写成已完成。
+- 禁止把 candidate `retrievedChunks` 全部伪装成 citations。
+- 禁止把历史 baseline 当作当前协议的重新执行证据。
+- 禁止把 Compose 静态解析描述成镜像已构建、服务已启动、一键部署已验证或生产部署。
+- 禁止让 Python 成为完整业务后端，或绕过 Java 权限访问任意 bucket/object。
+- 禁止缺失 Qdrant 的 `ownerUserId + kbId` filter。
+- 禁止提交 `.models/`、`.env`、API Key、JWT secret、MinIO/Redis/RabbitMQ/MySQL 密码。
+- 禁止为了技术栈数量引入 Kafka、Elasticsearch、Kubernetes、服务网格或注册中心。

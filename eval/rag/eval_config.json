@@ -1,0 +1,95 @@
+{
+  "name": "enterprise-knowledge-hub-rag-baseline",
+  "description": "最小可信 RAG 评测基线：覆盖检索、生成、引用、无答案和权限隔离。",
+  "default_top_k": 5,
+  "users": [
+    {
+      "key": "alice",
+      "username_prefix": "eval_alice",
+      "nickname": "Eval Alice",
+      "email_prefix": "eval_alice"
+    },
+    {
+      "key": "bob",
+      "username_prefix": "eval_bob",
+      "nickname": "Eval Bob",
+      "email_prefix": "eval_bob"
+    }
+  ],
+  "knowledge_bases": [
+    {
+      "key": "alice_core",
+      "owner": "alice",
+      "name": "Alice RAG Evaluation Core",
+      "description": "RAG evaluation corpus for Java backend and AI engineering facts."
+    },
+    {
+      "key": "bob_private",
+      "owner": "bob",
+      "name": "Bob Private Evaluation KB",
+      "description": "Private corpus used to verify retrieval and RAG permission isolation."
+    }
+  ],
+  "documents": [
+    {
+      "key": "alice_async_indexing",
+      "owner": "alice",
+      "kb": "alice_core",
+      "path": "documents/alice_async_indexing.txt"
+    },
+    {
+      "key": "alice_retrieval_security",
+      "owner": "alice",
+      "kb": "alice_core",
+      "path": "documents/alice_retrieval_security.txt"
+    },
+    {
+      "key": "alice_deletion_rag",
+      "owner": "alice",
+      "kb": "alice_core",
+      "path": "documents/alice_deletion_rag.txt"
+    },
+    {
+      "key": "alice_java_python_boundary",
+      "owner": "alice",
+      "kb": "alice_core",
+      "path": "documents/alice_java_python_boundary.txt"
+    },
+    {
+      "key": "alice_rag_evaluation",
+      "owner": "alice",
+      "kb": "alice_core",
+      "path": "documents/alice_rag_evaluation.txt"
+    },
+    {
+      "key": "alice_observability",
+      "owner": "alice",
+      "kb": "alice_core",
+      "path": "documents/alice_observability.txt"
+    },
+    {
+      "key": "alice_scope_boundary",
+      "owner": "alice",
+      "kb": "alice_core",
+      "path": "documents/alice_scope_boundary.txt"
+    },
+    {
+      "key": "bob_finance_policy",
+      "owner": "bob",
+      "kb": "bob_private",
+      "path": "documents/bob_finance_policy.txt"
+    },
+    {
+      "key": "bob_hr_policy",
+      "owner": "bob",
+      "kb": "bob_private",
+      "path": "documents/bob_hr_policy.txt"
+    },
+    {
+      "key": "bob_contract_policy",
+      "owner": "bob",
+      "kb": "bob_private",
+      "path": "documents/bob_contract_policy.txt"
+    }
+  ]
+}

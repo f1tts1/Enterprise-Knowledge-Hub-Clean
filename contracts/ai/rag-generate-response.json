@@ -1,0 +1,12 @@
+{
+  "answer": "合同签署后应在五个工作日内完成归档。[片段 1]",
+  "answer_status": "ANSWERED",
+  "cited_context_indexes": [1],
+  "no_answer_reason": null,
+  "llm_provider": "openai-compatible",
+  "llm_model": "contract-test-model",
+  "llm_latency_ms": 120,
+  "prompt_tokens": 42,
+  "completion_tokens": 18,
+  "total_tokens": 60
+}

@@ -1,0 +1,15 @@
+Alice 异步索引说明文档。
+
+Enterprise Knowledge Hub 上传文档后不会同步调用 Python。Spring Boot 先把文件上传到 MinIO，再在 MySQL 中写入 document 和 indexing_task。事务提交之后，Java 才向 RabbitMQ exchange `ekb.indexing.exchange` 发布消息，消息路由到队列 `ekb.indexing.tasks`。
+
+RabbitMQ 消息只保存 documentId 和 indexingTaskId。消费者拿到消息后重新查询 MySQL，读取 bucket、objectKey、fileName、checksum 和 ownerUserId，避免队列消息体与数据库记录漂移。
+
+如果 RabbitMQ 发布失败，indexing_task 仍保持 PENDING。PendingIndexingTaskRepublishScheduler 会通过 last_publish_attempt_at 原子 claim 和时间节流重新投递同一条 PENDING task，传输失败不会伪造业务索引失败。
+
+FastAPI 从 MinIO 下载文件，解析 TXT、Markdown、PDF、DOCX，切分 chunk，使用本地 BAAI/bge-small-zh-v1.5 生成 embedding，并把 chunk 向量写入 Qdrant。Python 返回 INDEXED、chunk_count 和 indexed_chunk_count 后，Java 才把 document 改成 INDEXED，把 indexing_task 改成 SUCCESS。
+
+如果 Python 调用失败，Java 会把 document.index_status 写成 INDEX_FAILED，把 indexing_task.status 写成 FAILED。用户调用 index-retry 时，系统会新建一条不可变的 MANUAL_RETRY task，并把它设置为 document.current_indexing_task_id；旧 FAILED task 保持终态，不会被重置成 PENDING。
+
+重复投递不是错误场景，而是异步队列必须接受的现实。消费者不会只依赖 RabbitMQ 消息是否出现过，而是依赖 MySQL 中 task 的当前状态和 current task fencing。只有当前 PENDING 任务才能进入 RUNNING，已经 SUCCESS 或 FAILED 的任务不会被重复消息重新拉回执行中。
+
+这种设计把 RabbitMQ 作为触发器，把 MySQL 作为事实来源。即使事务提交后应用短暂崩溃，只要任务仍然停留在 PENDING，重投器就可以再次发布同一 documentId 和 indexingTaskId。

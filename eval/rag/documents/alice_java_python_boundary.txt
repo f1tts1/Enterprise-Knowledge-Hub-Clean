@@ -1,0 +1,17 @@
+Alice Java 与 Python 服务边界说明文档。
+
+Enterprise Knowledge Hub 的业务主体是 Java 17 与 Spring Boot。Java 负责用户注册登录、BCrypt 密码哈希、JWT 签发和校验、知识库 owner 权限、文档元数据、索引任务状态、MinIO 存储编排和对外 API。
+
+FastAPI 负责 AI 能力和向量库访问细节，包括从 MinIO 下载文件、文档解析、文本切分、本地 embedding、Qdrant 写入、知识库内向量检索和 RAG 生成。Python 不直接修改 MySQL，也不判断完整用户权限。
+
+Java 与 Python 之间只通过 HTTP DTO 通信。Java 使用 WebClient 调用 FastAPI，不直接执行 Python 脚本或本地进程。这样可以让业务系统和 AI pipeline 独立部署，也便于替换 embedding 或 LLM provider。
+
+文件内容通过 MinIO 传递。Java 上传文件到 MinIO，只把 bucket 和 objectKey 等元数据传给 Python；Java 不把文件字节直接转发给 Python。MySQL 只保存业务元数据，不保存文件正文。
+
+本地 embedding 默认使用 BAAI/bge-small-zh-v1.5。LLM 生成使用 OpenAI-compatible Chat Completions，配置来自 LLM_PROVIDER、LLM_BASE_URL、LLM_API_KEY、LLM_MODEL，或者本机 DEEPSEEK_API_KEY。项目禁止把 API Key、JWT_SECRET 或 MinIO 密钥硬编码提交。
+
+服务拆分的边界也体现在失败处理上。FastAPI 文档索引失败时，只通过 HTTP 响应把错误传回 Java；Java 负责把 document 和 indexing_task 写成失败状态。FastAPI 不直接访问业务数据库，也不把成功状态写入 MySQL。
+
+Java 调 Python 的接口数量保持很少：文档索引、删除 vectors、向量检索和 RAG 生成。当前没有使用 gRPC，因为接口数量少、DTO 简单，HTTP 更便于本地调试和求职演示。后续如果接口数量和吞吐压力显著增加，再讨论 gRPC 才有意义。
+
+服务边界还要求前端只访问 Java API。浏览器页面不直接接触 Python、Qdrant、MinIO 或任何 LLM API Key。这样可以避免把内部服务地址和模型密钥暴露给客户端，也让权限校验入口保持单一。

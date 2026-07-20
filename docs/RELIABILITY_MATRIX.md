@@ -2,6 +2,8 @@
 
 本文档记录 Enterprise Knowledge Hub 当前异步索引、删除一致性和权限隔离相关的可靠性验证计划。它的目标是为求职展示提供可解释证据，而不是引入复杂的生产级一致性框架。
 
+确定性检查统一从仓库根目录执行 `./scripts/verify.sh`；测试分层见 `docs/TESTING.md`。`compose.yaml` 只是本机演示拓扑，当前验证边界见 `docs/DEPLOYMENT.md`，Compose 配置可解析不等于镜像构建、服务启动或故障演练已经通过。
+
 ## 当前可靠性边界
 
 当前系统选择：
@@ -84,20 +86,24 @@ Mockito/MyBatis wrapper 测试不能替代真实 MySQL 事务和并发竞争；M
 | R09 | 删除后同内容重传 | deleted 历史 checksum 不阻塞同内容再次上传和再次删除 | 同内容文档上传、删除、重传、再删除 | 第二次上传和删除均成功 | `scripts/test_document_reupload_delete.sh` | 演练脚本已就绪 |
 | R10 | 删除后 Qdrant 残留防线 | 即使 Qdrant 残留 vectors，Java 返回前也按 MySQL 二次过滤 | Qdrant 删除失败后恢复服务、但在重试 DELETE 前检索同一标记 | 控制文档保证检索真实下游调用；目标 docId/chunk 不返回 | `scripts/test_document_delete_failure_recovery.sh qdrant` | 演练脚本已就绪 |
 | R11 | 跨用户检索隔离 | Alice/Bob 不能检索或 RAG 到对方知识库内容 | Alice/Bob 各自上传私有文档并互查 | 直接访问对方 kb 返回 404；本库检索不出现 forbidden terms | 自包含 fixture；`scripts/test_retrieval_permission.sh`、`scripts/test_rag_permission.sh` | 演练脚本已就绪 |
-| R12 | 空知识库 RAG 短路 | 无已索引 chunk 时返回短路响应 | 空知识库调用 RAG | 固定无上下文答案，citations/retrievedChunks 为空 | `scripts/test_rag_empty_kb.sh` | 演练脚本已就绪；不等同外部 LLM 调用计数证据 |
+| R12 | 空知识库 RAG 短路 | 无已索引 chunk 时不调用 LLM | 空知识库调用 RAG | `answerStatus=NO_CONTEXT`、`noAnswer=true`、原因非空，citations/retrievedChunks 为空 | Java 单测；`scripts/test_rag_empty_kb.sh` | 确定性测试已纳入统一入口；演练脚本已就绪 |
 | R13 | 并发上传触发 Qdrant schema 初始化 | 两个索引任务接近同时写 Qdrant 时，不应因 collection 或 payload index 已存在而失败 | 并发上传两份文档；首次 schema 初始化压力验证需在一次性环境先清空 collection | 两个文档均 `INDEXED/SUCCESS`，两个唯一标记均可检索 | 手工步骤，当前无脚本 | 待验证 |
 | R14 | 同知识库并发同内容上传 | 两个请求同时上传相同文件时，只能创建一个 active document，失败请求不应先写出额外 MinIO object | 同一用户同一知识库并发上传同一文件 | 一条成功，一条 `409003 DOCUMENT_ALREADY_EXISTS`；成功文档可索引 | 历史记录；当前无脚本 | 待重建证据 |
 | R15 | 索引 timeout 原子性 | current task/document 必须同时进入失败态 | 构造 `RUNNING + INDEXING` 且 started_at 超时 | 同一短事务写 `FAILED + INDEX_FAILED`；任一 CAS 失败则整体回滚 | Java rollbackOnly 单测；真实 MySQL 事务验证待补 | 自动测试已通过；真实事务待验证 |
 | R16 | 并发人工 retry | 同一 FAILED attempt 只能创建一个后继 attempt | 两个请求并发调用 `/index-retry` | 唯一约束 + current pointer CAS 只允许一个赢家，无孤立新 task | 唯一约束设计与顺序单测；真实 MySQL 并发验证待补 | 部分验证 |
 | R17 | 知识库删除与文档上传 | “无活动文档检查”不能被并发上传穿透 | 同一 KB 并发 DELETE 与上传 | 两条写路径按 knowledge_base 行锁串行；要么删除冲突，要么上传得到 NOT_FOUND | 真实 MySQL 并发验证待补 | 设计落地 |
 | R18 | MinIO 写入后的事务回滚 | 数据库明确回滚时不留下本次孤儿 object，同时不误判 commit outcome unknown | 在 MinIO put 后注入事务 rollback / unknown | ROLLED_BACK 按 objectKey 清理；UNKNOWN 只告警并保留 object | 代码路径；事务故障注入待补 | 设计落地 |
+| R19 | RAG no-answer 与实际引用协议 | 候选 chunk 不得全部伪装成 citation；拒答必须结构化 | 构造有效/重复/越界/缺失引用、纯 sentinel 与混合 sentinel 响应 | `ANSWERED` 只映射实际有效引用；`INSUFFICIENT_CONTEXT` 引用为空；无效协议返回 AI 服务失败；outcome 为 `answered/no_context/insufficient_context/failed` | Java/Python 单测；`scripts/test_rag_ask.sh` | 确定性测试已纳入统一入口；真实 LLM 回归待执行 |
 
 ## 手动验证顺序
 
 推荐按从稳定到破坏性排序执行：
 
 ```bash
-cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub"
+# 以下命令都从仓库根目录执行。
+
+# 0. 先执行不启动服务的确定性核心检查
+./scripts/verify.sh
 
 # 1. 权限、删除残留和基本检索隔离
 ./scripts/test_retrieval_permission.sh
@@ -108,7 +114,8 @@ cd "/Users/fitts/codeProjects/Projects/Enterprise Knowledge Hub"
 # 3. 知识库删除保护
 ./scripts/test_knowledge_base_delete_guard.sh
 
-# 4. RAG 权限和空知识库短路
+# 4. RAG 正常回答、权限和空知识库短路
+./scripts/test_rag_ask.sh
 ./scripts/test_rag_empty_kb.sh
 ./scripts/test_rag_permission.sh
 
@@ -126,6 +133,8 @@ MYSQL_DEFAULTS_FILE=... ./scripts/test_document_delete_failure_recovery.sh minio
 
 `MYSQL_DEFAULTS_FILE` 指向本地 MySQL client 配置文件；脚本只执行固定的只读状态查询，不打印数据库或 RabbitMQ 凭证。两条 P0-3 故障脚本不会自行启停服务，会在注入点等待操作者停止/恢复对应本地依赖。外部演练实际执行并保存日期与关键输出前，状态只能写“脚本已就绪”。R13、R14 仍无当前脚本，不把历史文件名当作证据。
 
+正常 RAG 脚本会调用真实 LLM，只有配置、网络和模型响应都满足当前结构化协议时才有意义；它不纳入核心 CI。`NO_CONTEXT` 的 Java 短路、模型 sentinel 对应的 `INSUFFICIENT_CONTEXT`、有效/无效引用映射已经有确定性测试，但仍不能替代真实跨进程调用记录。
+
 外部演练完成后，按下面最小字段追加记录，不保存 token、密码、完整问题或文档正文：
 
 ```text
@@ -141,6 +150,10 @@ Git commit：
 ```
 
 ## 已验证记录
+
+### 2026-07-17（P1 资产状态，不是外部演练记录）
+
+仓库已加入统一 `scripts/verify.sh`、双端 DTO fixture、loader/splitter/Qdrant/固定数据集测试、结构化 no-answer/实际引用测试以及本机 Compose 配置。当前工作树实际执行结果为 Java 62 个测试、Python 30 个测试及 shell 语法检查通过，Compose 静态解析通过。本文没有记录 Compose 镜像构建、容器启动、真实 LLM RAG 或端到端故障演练结果；这些操作实际执行前只能描述为“配置/脚本已就绪”。
 
 ### 2026-07-16
 

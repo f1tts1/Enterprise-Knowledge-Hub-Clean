@@ -135,6 +135,7 @@ assert_rag_chunks_contain() {
 
   printf '%s' "$response" | python3 -c '
 import json
+import re
 import sys
 
 expected = sys.argv[1]
@@ -148,6 +149,12 @@ errors = []
 
 if not answer.strip():
     errors.append("answer 为空")
+if data.get("answerStatus") != "ANSWERED":
+    errors.append("answerStatus 应为 ANSWERED")
+if data.get("noAnswer") is not False:
+    errors.append("noAnswer 应为 false")
+if data.get("noAnswerReason") is not None:
+    errors.append("noAnswerReason 应为 null")
 if not citations:
     errors.append("citations 为空")
 if not chunks:
@@ -156,6 +163,20 @@ if citations and citations[0].get("score") is None:
     errors.append("citations[0].score 为空")
 if expected not in joined_chunks:
     errors.append("retrievedChunks 未包含期望内容")
+
+for citation in citations:
+    index = citation.get("index")
+    if not isinstance(index, int) or index < 1 or index > len(chunks):
+        errors.append("citations.index 超出检索上下文范围")
+        continue
+    if not re.search(rf"\[片段\s+{index}\]", answer):
+        errors.append(f"答案没有实际引用 citations.index={index}")
+    if not any(
+        chunk.get("docId") == citation.get("docId")
+        and chunk.get("chunkId") == citation.get("chunkId")
+        for chunk in chunks
+    ):
+        errors.append(f"citation {index} 不属于 retrievedChunks")
 
 if errors:
     print("RAG 响应校验失败: " + "；".join(errors), file=sys.stderr)

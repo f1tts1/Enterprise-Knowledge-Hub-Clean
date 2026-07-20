@@ -79,6 +79,12 @@ errors = []
 
 if data.get("answer") != expected_answer:
     errors.append("answer 不符合空知识库预期")
+if data.get("answerStatus") != "NO_CONTEXT":
+    errors.append("answerStatus 应为 NO_CONTEXT")
+if data.get("noAnswer") is not True:
+    errors.append("noAnswer 应为 true")
+if data.get("noAnswerReason") != "NO_RETRIEVED_CONTEXT":
+    errors.append("noAnswerReason 应为 NO_RETRIEVED_CONTEXT")
 if data.get("citations") != []:
     errors.append("citations 应为空数组")
 if data.get("retrievedChunks") != []:

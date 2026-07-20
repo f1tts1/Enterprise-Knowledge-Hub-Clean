@@ -564,6 +564,9 @@ Content-Type: application/json
 {
   "question": "RabbitMQ 在这个项目里解决了什么问题？",
   "answer": "RabbitMQ 用于把文档上传和索引处理解耦... [片段 1]",
+  "answerStatus": "ANSWERED",
+  "noAnswer": false,
+  "noAnswerReason": null,
   "topK": 5,
   "llmProvider": "openai-compatible",
   "llmModel": "your-chat-model",
@@ -604,10 +607,25 @@ Content-Type: application/json
 
 - Java 先校验当前用户拥有 `{kbId}`。
 - Java 复用 `retrieval/search` 服务获得已按 MySQL 二次过滤后的 chunk。
-- 如果没有可用已索引 chunk，Java 不调用 LLM，直接返回无上下文答案，`citations=[]`、`retrievedChunks=[]`。
+- 如果没有检索 chunk，Java 不调用 LLM，返回 `answerStatus=NO_CONTEXT`、`noAnswer=true`、`noAnswerReason=NO_RETRIEVED_CONTEXT`，且 `citations=[]`、`retrievedChunks=[]`。
+- 如果命中只有空白正文，Java 同样不调用 LLM，返回 `NO_CONTEXT/NO_USABLE_CONTEXT`；`retrievedChunks` 保留本次候选以便排查。
+- `RAG_MINIMUM_RELEVANCE_SCORE` 默认 `-1` 禁用。配置为非负值后，低于阈值或 score 缺失的 chunk 不传给生成服务；过滤后为空时返回 `INSUFFICIENT_CONTEXT/LOW_RELEVANCE`，不调用 LLM，`retrievedChunks` 仍保留候选。
 - 如果存在可用 chunk，Java 调用 Python 内部接口 `POST /api/v1/rag/generate` 生成答案。
-- Python prompt 要求 LLM 使用 `[片段 n]` 标记说明答案依据；Java 响应中的 `citations[].index` 与该片段编号对应，`citations[].score` 为 Qdrant 检索分数。
+- Python 将正常回答解析为 `ANSWERED`，并提取答案实际出现的 `[片段 n]`。编号按首次出现顺序去重且必须位于本次生成上下文范围。
+- `citations` 只映射答案实际引用的 chunk；`retrievedChunks` 是权限过滤后的全部检索候选。`citations[].index` 对应发送给 LLM 的上下文编号，`score` 为该 Qdrant 命中分数。
+- 模型只返回受控 sentinel 时，Python 转成 `INSUFFICIENT_CONTEXT/MODEL_REPORTED_INSUFFICIENT_CONTEXT`，`citations=[]`；sentinel 不会透传给客户端。
+- Python 返回空答案、无引用 answered、越界引用、未知状态或 sentinel 与其它文本混用时，Java/Python 均不猜测引用，按 AI 服务契约失败返回 `503001`。
 - 当前是同步问答接口，不支持 SSE，不写入 conversation/chat_message/answer_citation。
+
+状态枚举：
+
+| `answerStatus` | `noAnswer` | 是否调用 LLM | 含义 |
+|---|---:|---:|---|
+| `ANSWERED` | `false` | 是 | 有正文且至少一个合法实际引用 |
+| `NO_CONTEXT` | `true` | 否 | 无检索候选或候选正文不可用 |
+| `INSUFFICIENT_CONTEXT` | `true` | 否/是 | 阈值过滤为空，或模型按受控协议拒答 |
+
+`noAnswerReason` 当前可能为 `NO_RETRIEVED_CONTEXT`、`NO_USABLE_CONTEXT`、`LOW_RELEVANCE`、`MODEL_REPORTED_INSUFFICIENT_CONTEXT`；answered 时为 `null`。
 
 错误：
 
@@ -821,7 +839,10 @@ Content-Type: application/json
 
 ```json
 {
-  "answer": "RabbitMQ 用于把文档上传和索引处理解耦...",
+  "answer": "RabbitMQ 用于把文档上传和索引处理解耦... [片段 1]",
+  "answer_status": "ANSWERED",
+  "cited_context_indexes": [1],
+  "no_answer_reason": null,
   "llm_provider": "openai-compatible",
   "llm_model": "your-chat-model",
   "llm_latency_ms": 842,
@@ -839,6 +860,9 @@ Content-Type: application/json
 - 可显式配置 `LLM_PROVIDER=openai-compatible`、`LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`。
 - 如果本机存在 `DEEPSEEK_API_KEY`，Python 会自动使用 DeepSeek 默认配置：`LLM_BASE_URL=https://api.deepseek.com/v1`、`LLM_MODEL=deepseek-chat`。
 - Python 调用 OpenAI-compatible provider 时继续传递本次 `X-Request-Id`。
+- 模型缺少依据时必须只输出 `__EKB_NO_ANSWER__`。Python 将其转换为固定用户文案、`answer_status=INSUFFICIENT_CONTEXT`、空引用编号和 `no_answer_reason=MODEL_REPORTED_INSUFFICIENT_CONTEXT`。
+- 正常回答必须至少包含一个 `[片段 n]`；Python 按首次出现顺序去重并校验 `1 <= n <= len(contexts)`。
+- sentinel 与其它文本混用、正常回答无引用或引用越界都返回 503，不把全部 context 伪装成引用。
 - `llm_latency_ms` 是当前非流式 Chat Completions 的完整 HTTP 调用耗时，不是 TTFT。
 - token usage 由 provider 响应提供；provider 未返回时三个字段可为 `null`。Java 的 `model_call_log` 只持久化 prompt/completion 两列，缺失值按当前 schema 记录为 0，不能据此断言 provider 实际消耗为 0。
 
@@ -971,6 +995,17 @@ deadLetterRoutingKey: indexing.task.dead
 | contexts[].score | contexts[].score | contexts[].score |
 | contexts[].text | contexts[].text | contexts[].text |
 
+生成响应映射：
+
+| Python JSON | Java DTO | 含义 |
+|---|---|---|
+| answer | answer | 已清洗的答案或固定拒答文案 |
+| answer_status | answerStatus | `ANSWERED` / `INSUFFICIENT_CONTEXT` |
+| cited_context_indexes | citedContextIndexes | 答案实际引用的 1-based context 编号 |
+| no_answer_reason | noAnswerReason | 模型拒答原因；answered 时为 null |
+| llm_provider | llmProvider | provider 标识 |
+| llm_model | llmModel | 模型标识 |
+
 ### Python 可观测响应字段映射
 
 Python 使用 snake_case，Java DTO 使用 camelCase：
@@ -1048,6 +1083,8 @@ Point payload：
   "createdAt": "2026-06-15T00:00:00+00:00"
 }
 ```
+
+`charStart`/`charEnd` 是 splitter 在单页文本去首尾空白、压缩空白并执行 overlap 时生成的逻辑 span，0-based、end-exclusive，满足 `charEnd - charStart == len(text)`。递归边界重组可能改变分隔空白，因此它们不是 loader 原文的严格切片坐标，更不是原始文件字节 offset、Word XML offset 或 PDF 版面坐标；当前引用应以 `pageNo + chunkIndex + text` 为主要溯源证据。
 
 ## 状态约定
 

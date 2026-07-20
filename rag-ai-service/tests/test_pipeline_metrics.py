@@ -147,7 +147,7 @@ class _FakeHttpResponse:
 
     def json(self) -> dict:
         return {
-            "choices": [{"message": {"content": "private generated answer"}}],
+            "choices": [{"message": {"content": "private generated answer [片段 1]"}}],
             "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
         }
 
@@ -194,6 +194,9 @@ class RagGenerationMetricsTest(unittest.IsolatedAsyncioTestCase):
             reset_request_id(token)
 
         self.assertEqual("java-request-2", client.headers[REQUEST_ID_HEADER])
+        self.assertEqual("ANSWERED", response.answer_status)
+        self.assertEqual([1], response.cited_context_indexes)
+        self.assertIsNone(response.no_answer_reason)
         self.assertEqual(11, response.prompt_tokens)
         self.assertEqual(7, response.completion_tokens)
         self.assertEqual(18, response.total_tokens)

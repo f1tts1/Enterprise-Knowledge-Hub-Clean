@@ -1,0 +1,23 @@
+{
+  "question": "合同归档时限是什么？",
+  "contexts": [
+    {
+      "doc_id": 33,
+      "chunk_id": "doc-33-chunk-0",
+      "file_name": "contract-policy.pdf",
+      "page_no": 2,
+      "chunk_index": 0,
+      "score": 0.82,
+      "text": "合同签署后应在五个工作日内完成归档。"
+    },
+    {
+      "doc_id": 33,
+      "chunk_id": "doc-33-chunk-1",
+      "file_name": "contract-policy.pdf",
+      "page_no": 3,
+      "chunk_index": 1,
+      "score": 0.76,
+      "text": "归档材料由合同经办人提交。"
+    }
+  ]
+}

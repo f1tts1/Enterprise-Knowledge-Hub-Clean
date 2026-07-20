@@ -17,7 +17,7 @@ class AiObservabilityMetricsTest {
 
         metrics.recordIndexingAttempt("success", "none", 1_000_000L);
         metrics.recordRetrieval("success", 2_000_000L, 3);
-        metrics.recordRag("generated", 3_000_000L, 1_000_000L, 2_000_000L);
+        metrics.recordRag("answered", 3_000_000L, 1_000_000L, 2_000_000L);
         metrics.recordModelCall("CHAT", "success", 25L);
         metrics.recordLlmTokens(10, 4);
 
@@ -30,7 +30,7 @@ class AiObservabilityMetricsTest {
                 .summary()
                 .totalAmount()).isEqualTo(3.0);
         assertThat(registry.find("ekb.rag.phase.duration")
-                .tags("phase", "generation", "outcome", "generated")
+                .tags("phase", "generation", "outcome", "answered")
                 .timer()
                 .count()).isEqualTo(1L);
         assertThat(registry.find("ekb.llm.tokens")

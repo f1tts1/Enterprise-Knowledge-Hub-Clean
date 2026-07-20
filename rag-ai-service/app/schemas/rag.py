@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -24,6 +26,9 @@ class RagGenerateRequest(BaseModel):
 
 class RagGenerateResponse(BaseModel):
     answer: str
+    answer_status: Literal["ANSWERED", "INSUFFICIENT_CONTEXT"]
+    cited_context_indexes: list[int] = Field(default_factory=list)
+    no_answer_reason: str | None = None
     llm_provider: str
     llm_model: str
     # 当前是非流式 Chat Completions，只记录完整调用耗时，不能描述为 TTFT。

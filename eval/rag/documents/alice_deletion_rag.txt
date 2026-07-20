@@ -1,0 +1,17 @@
+Alice 删除一致性与 RAG 问答说明文档。
+
+文档删除采用状态驱动的最终一致性方案。文档处于 PENDING_INDEX 或 INDEXING 时，删除接口返回 409004 DOCUMENT_BUSY，当前版本不支持同一文档同时索引和删除。
+
+删除开始时，Java 先把 MySQL document 改成 DELETING，并立即设置 is_deleted=1。这样文档会立刻从列表、详情和检索结果中消失。随后 Java 调用 FastAPI 的 delete-vectors 内部接口。
+
+Python 删除 Qdrant vectors 时必须同时使用 ownerUserId、kbId 和 docId 三个字段作为 filter。Qdrant collection 不存在或目标 point 不存在，都视为幂等成功。Java 随后删除 MinIO object，并最终把文档状态改成 DELETED。
+
+如果 Qdrant 删除或 MinIO 删除失败，Java 会把 document.index_status 改成 DELETE_FAILED，同时保持 is_deleted=1。用户再次调用 DELETE 可以重试清理流程，业务侧仍然不会返回这份文档。
+
+RAG 问答由 Java 编排。Java 先复用 retrieval/search 完成知识库 owner 校验、Qdrant 检索和 MySQL 二次过滤，再把过滤后的 chunk contexts 传给 Python 生成答案。Python 只负责 OpenAI-compatible Chat Completions 调用。
+
+如果知识库没有任何可用的已索引 chunk，Java 直接返回“当前知识库没有可用于回答该问题的已索引内容。”，不调用 LLM。RAG 响应包含 answer、citations 和 retrievedChunks；引用编号要求使用 [片段 1]、[片段 2] 这样的格式。
+
+当前 RAG 生成不写入 conversation、chat_message 或 answer_citation 表。这样做是为了先把同步问答、检索复用、引用返回和权限隔离稳定下来。会话落库会引入消息顺序、引用审计和历史上下文管理，属于后续阶段。
+
+无答案判断当前也保持保守。空知识库直接短路，非空知识库仍主要依赖检索结果和 prompt 约束。更复杂的 no-answer 需要结合相似度阈值和评测集结果，而不是提前写死一套规则。

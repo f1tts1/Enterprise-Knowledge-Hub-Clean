@@ -292,7 +292,7 @@
 
 ## D18：RAG 问答采用 Java 编排 + Python 生成
 
-决策：Java 对外提供 `POST /api/v1/knowledge-bases/{kbId}/rag/ask`，先复用现有检索服务完成 owner 校验、Qdrant 检索和 MySQL 二次过滤；Python 只提供内部 `POST /api/v1/rag/generate`，根据 Java 传入的 chunk context 调 OpenAI-compatible LLM 生成答案。
+决策：Java 对外提供 `POST /api/v1/knowledge-bases/{kbId}/rag/ask`，先复用现有检索服务完成 owner 校验、Qdrant 检索和 MySQL 二次过滤；Python 只提供内部 `POST /api/v1/rag/generate`，根据 Java 传入的 chunk context 调 OpenAI-compatible LLM 生成答案。Python 将模型文本收敛成结构化 answer status 和实际引用编号，Java 再把编号映射回已过滤 chunk。
 
 原因：
 
@@ -300,11 +300,13 @@
 - retrieval/search 已经验证过 Qdrant filter 和删除残留过滤，RAG 复用它可以减少重复权限逻辑。
 - Python 保留 AI provider 调用细节，Java 不直接绑定具体 LLM SDK 或 API 协议。
 - 当前先做同步接口，便于稳定演示和排查；SSE、多轮会话、引用落库后续再单独推进。
+- `citations` 必须来自答案实际出现且通过范围校验的 `[片段 n]`；候选 `retrievedChunks` 不能全部伪装成已引用证据。
+- 无候选由 Java 返回 `NO_CONTEXT`；模型完整返回 sentinel 时返回 `INSUFFICIENT_CONTEXT`；正常回答返回 `ANSWERED`。无引用、越界引用和 sentinel 混用属于 provider 契约失败。
 
 放弃方案：
 
 - 暂不让客户端直接调用 Python RAG 接口。原因是 Python 不做登录态和完整业务权限判断。
-- 暂不实现 SSE、Agent、query rewrite、rerank 或复杂 no-answer 判断。原因是当前阶段先验证最小 RAG 闭环。
+- 暂不实现 SSE、Agent、query rewrite、rerank 或复杂 no-answer 模型。当前结构化拒答只是最小工程协议，不宣称解决开放问题的语义可靠性。
 
 ## D19：文档 checksum 去重只约束未删除文档
 
@@ -479,7 +481,7 @@
 
 - 求职证据的价值来自可复现和边界准确，而不是脚本、类或状态名的数量。
 - 为了制造慢 worker 或依赖错误而增加生产故障端点，会扩大攻击面并污染 Java/Python 业务边界。
-- 当前仓库没有统一 Compose 容器名，脚本直接 stop/start 容器会绑定个人环境；人工切换依赖、脚本负责断言，更适合本地求职演示。
+- 即使仓库已有统一 Compose 服务名，故障脚本仍不主动 stop/start 容器：操作者控制故障注入，脚本只断言业务状态，避免误停共享或非 Compose 环境中的依赖。
 - RabbitMQ/Qdrant/MinIO 外部演练成本较高，不应放入默认单元测试；但必须留下明确命令、前置条件和证据字段。
 
 放弃方案：
@@ -488,3 +490,55 @@
 - 不增加 test-only Controller、管理 API、慢响应开关或绕过权限的内部查询接口。
 - 不让脚本猜测并停止固定容器名，也不自动修改业务表伪造状态。
 - 不把 shell 语法通过、Mockito 测试通过或历史 Redis Stream 记录写成 RabbitMQ/Qdrant/MinIO 外部故障已经通过。
+
+## D26：核心证据采用自包含 fixture、跨语言契约与单一验证入口
+
+决策：仓库用 `scripts/verify.sh` 统一运行 shell 语法、Java 单元测试和 Python 核心测试；GitHub Actions 调用同一入口。Java/Python RAG DTO 使用 `contracts/ai` 中的共享 JSON fixture 双向校验；固定 RAG 文档和问题必须随仓库提交，运行结果保持忽略。
+
+原因：
+
+- 新 clone 不应依赖个人绝对路径、被忽略的临时文件、已启动中间件或真实 LLM 才能验证核心规则。
+- 单独测试 Java record 和 Pydantic model 仍可能让字段名漂移；共享 fixture 能在 PR 阶段暴露内部 HTTP 契约不兼容。
+- loader、splitter、Qdrant filter/payload 和生成协议是 AI 工程链路的高价值确定性边界，适合轻量 CI。
+- E2E、真实故障和模型质量受环境影响，必须与核心 CI 分层，避免 flaky 结果和伪证据。
+
+边界与放弃方案：
+
+- CI 不下载 embedding 模型，不启动 MySQL/RabbitMQ/MinIO/Qdrant，不调用真实 LLM。
+- 不追求覆盖率数字，不把所有 shell E2E 塞入 PR gate，不为 CI 引入大型 Testcontainers 拓扑。
+- `eval/rag/results` 不提交；历史结果只能明确标记为当时协议的证据。
+
+## D27：最小 no-answer 使用结构化协议，统一相似度阈值默认关闭
+
+决策：Python prompt 要求无法回答时只输出 `__EKB_NO_ANSWER__`，并将响应解析为 `answer_status`、`cited_context_indexes`、`no_answer_reason`。Java 返回 `answerStatus`、`noAnswer`、`noAnswerReason`，只映射实际引用。可选 `RAG_MINIMUM_RELEVANCE_SCORE` 默认 `-1` 关闭。
+
+原因：
+
+- 中文关键词判断“无法回答”容易误判正常答案，也无法稳定区分业务短路与模型拒答。
+- 受控 sentinel 和引用范围校验能形成明确 API 契约、失败行为和单元测试证据。
+- 历史 fixed baseline 中可回答题 top1 最低分约 0.4685，而无答案题最高分约 0.5627，二者重叠；启用一个未经验证的全局阈值会误拒可回答问题。
+- 实际 citation 与 candidate retrieval 分离后，引用正确性才具有可信语义。
+
+边界与放弃方案：
+
+- 该协议不等于 entailment/groundedness 检测，也不保证模型永远遵循 sentinel。
+- provider 返回无引用答案、越界编号或混合 sentinel 时返回 503，不猜测或伪造引用。
+- 暂不增加 hybrid、rerank、query rewrite、分类模型或正式 RAG 评测平台；阈值启用前必须用当前代码和数据重跑。
+
+## D28：Compose 只服务本机可复现演示，不包装成生产编排
+
+决策：根 `compose.yaml` 编排六个基础/初始化服务和两个应用服务；使用 `.env` 注入本地凭证、命名卷保存数据与模型、`model-init` 一次性下载 embedding，所有宿主端口绑定 `127.0.0.1`。
+
+原因：
+
+- 求职演示需要降低新环境准备成本，并明确 Java/Python/中间件的真实拓扑。
+- embedding 模型体积大且不能进 Git，把它放命名卷可复用下载结果并对运行服务只读。
+- FastAPI 尚无独立服务 token，本机端口绑定比把内部 API 暴露到局域网更符合当前信任边界。
+- 单机 Compose 足以解决当前复现问题，不需要 Kubernetes、Helm 或服务注册中心。
+
+边界与放弃方案：
+
+- V1 只允许空 MySQL 卷首次初始化；已有库按缺失迁移处理。
+- 静态 `docker compose config` 通过不等于镜像 build、服务 up 或 E2E 已验证，证据必须分开记录。
+- 不新增匿名 health API、生产 TLS、高可用、备份、滚动升级或 secret manager 的虚假包装。
+- 不把 Compose 文件称为生产部署方案，不扩展 Kubernetes/Helm/服务网格。

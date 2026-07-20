@@ -17,15 +17,7 @@ from urllib import error, request
 
 DEFAULT_BASE_URL = "http://localhost:8080"
 DEFAULT_DATASET_DIR = Path("eval/rag")
-NO_ANSWER_MARKERS = (
-    "不足",
-    "没有",
-    "无法",
-    "不能回答",
-    "未提供",
-    "不包含",
-    "没有可用于",
-)
+NO_ANSWER_STATUSES = {"NO_CONTEXT", "INSUFFICIENT_CONTEXT"}
 
 
 @dataclass
@@ -284,13 +276,20 @@ def evaluate_question(args: argparse.Namespace, question: dict[str, Any], state:
     forbidden_leak_retrieval = contains_any(retrieval_text, question.get("forbidden_terms") or [])
 
     rag_payload = None
-    rag_text = ""
     answer = None
+    answer_status = None
+    no_answer = None
+    no_answer_reason = None
     citations = []
     answer_correct = None
     citation_correct = None
     no_answer_pass = None
+    answer_question_echo = False
+    forbidden_leak_rag_chunks = False
+    forbidden_leak_citations = False
+    forbidden_leak_answer_source = False
     forbidden_leak_rag = False
+    rag_api_failed = False
     if not args.retrieval_only:
         rag_result = post_json(
             args,
@@ -301,21 +300,62 @@ def evaluate_question(args: argparse.Namespace, question: dict[str, Any], state:
         if rag_result.success:
             rag_payload = rag_result.data
             answer = str(rag_payload.get("answer") or "")
+            answer_status = rag_payload.get("answerStatus")
+            no_answer = rag_payload.get("noAnswer")
+            no_answer_reason = rag_payload.get("noAnswerReason")
             citations = rag_payload.get("citations") or []
-            rag_text = join_texts(
-                [answer]
-                + [citation.get("text") for citation in citations]
-                + [chunk.get("text") for chunk in rag_payload.get("retrievedChunks") or []]
+            rag_chunks_text = join_texts(
+                [chunk.get("text") for chunk in rag_payload.get("retrievedChunks") or []]
             )
-            forbidden_leak_rag = contains_any(rag_text, question.get("forbidden_terms") or [])
+            citation_text = join_texts([citation.get("text") for citation in citations])
+            forbidden_terms = question.get("forbidden_terms") or []
+            forbidden_leak_rag_chunks = contains_any(rag_chunks_text, forbidden_terms)
+            forbidden_leak_citations = contains_any(citation_text, forbidden_terms)
+            answer_forbidden_terms = matching_terms(answer, forbidden_terms)
+            source_text = join_texts([rag_chunks_text, citation_text])
+            question_text = str(question.get("question") or "")
+            answer_question_echo = any(
+                term in question_text and term not in source_text
+                for term in answer_forbidden_terms
+            )
+            forbidden_leak_answer_source = any(
+                term not in question_text or term in source_text
+                for term in answer_forbidden_terms
+            )
+            forbidden_leak_rag = any((
+                forbidden_leak_rag_chunks,
+                forbidden_leak_citations,
+                forbidden_leak_answer_source,
+            ))
             answer_terms = question.get("answer_terms") or []
             if question.get("should_answer", True) and answer_terms:
-                answer_correct = contains_all(answer, answer_terms)
+                answer_correct = (
+                    answer_status == "ANSWERED"
+                    and no_answer is False
+                    and contains_all(answer, answer_terms)
+                )
             if question.get("should_answer", True) and expected_doc_ids:
-                citation_correct = any(citation.get("docId") in expected_doc_ids for citation in citations)
+                citation_correct = (
+                    answer_status == "ANSWERED"
+                    and any(citation.get("docId") in expected_doc_ids for citation in citations)
+                )
             if not question.get("should_answer", True):
-                no_answer_pass = (not forbidden_leak_rag) and contains_any(answer, NO_ANSWER_MARKERS)
+                no_answer_pass = (
+                    answer_status in NO_ANSWER_STATUSES
+                    and no_answer is True
+                    and bool(no_answer_reason)
+                    and not citations
+                    and not answer_question_echo
+                    and not forbidden_leak_rag
+                )
         else:
+            rag_api_failed = True
+            if question.get("should_answer", True) and question.get("answer_terms"):
+                answer_correct = False
+            if question.get("should_answer", True) and expected_doc_ids:
+                citation_correct = False
+            if not question.get("should_answer", True):
+                no_answer_pass = False
             rag_payload = {
                 "http_status": rag_result.status,
                 "code": rag_result.code,
@@ -332,6 +372,10 @@ def evaluate_question(args: argparse.Namespace, question: dict[str, Any], state:
         bad_case_reasons.append("retrieval_forbidden_term_leak")
     if forbidden_leak_rag:
         bad_case_reasons.append("rag_forbidden_term_leak")
+    if rag_api_failed:
+        bad_case_reasons.append("rag_api_failed")
+    if answer_question_echo and not question.get("should_answer", True):
+        bad_case_reasons.append("no_answer_question_echo")
     if answer_correct is False:
         bad_case_reasons.append("answer_terms_missing")
     if citation_correct is False:
@@ -357,10 +401,18 @@ def evaluate_question(args: argparse.Namespace, question: dict[str, Any], state:
         "evidence_hit": evidence_hit,
         "forbidden_leak_retrieval": forbidden_leak_retrieval,
         "answer": answer,
+        "answer_status": answer_status,
+        "no_answer": no_answer,
+        "no_answer_reason": no_answer_reason,
         "answer_correct": answer_correct,
         "citation_correct": citation_correct,
         "no_answer_pass": no_answer_pass,
+        "answer_question_echo": answer_question_echo,
+        "forbidden_leak_rag_chunks": forbidden_leak_rag_chunks,
+        "forbidden_leak_citations": forbidden_leak_citations,
+        "forbidden_leak_answer_source": forbidden_leak_answer_source,
         "forbidden_leak_rag": forbidden_leak_rag,
+        "rag_api_failed": rag_api_failed,
         "permission_pass": permission_pass,
         "retrieval_records_preview": [
             {
@@ -425,6 +477,21 @@ def summarize(results: list[dict[str, Any]], args: argparse.Namespace) -> dict[s
             "forbidden_leak_count": sum(
                 1 for r in results
                 if r.get("forbidden_leak_retrieval") or r.get("forbidden_leak_rag")
+            ),
+            "question_echo_count": sum(
+                1 for r in results if r.get("answer_question_echo")
+            ),
+            "retrieval_leak_count": sum(
+                1 for r in results if r.get("forbidden_leak_retrieval")
+            ),
+            "rag_chunk_leak_count": sum(
+                1 for r in results if r.get("forbidden_leak_rag_chunks")
+            ),
+            "citation_leak_count": sum(
+                1 for r in results if r.get("forbidden_leak_citations")
+            ),
+            "answer_source_leak_count": sum(
+                1 for r in results if r.get("forbidden_leak_answer_source")
             ),
         },
         "bad_case_count": len(bad_cases),
@@ -612,6 +679,10 @@ def contains_all(text: str, terms: list[str]) -> bool:
 
 def contains_any(text: str, terms: list[str] | tuple[str, ...]) -> bool:
     return any(term in text for term in terms)
+
+
+def matching_terms(text: str, terms: list[str]) -> list[str]:
+    return [term for term in terms if term in text]
 
 
 def preview(text: str, limit: int = 180) -> str:
